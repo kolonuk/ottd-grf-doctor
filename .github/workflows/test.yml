@@ -1,0 +1,71 @@
+name: Test
+
+# Manual trigger only for now -- this downloads and runs a real OpenTTD
+# binary against the fixture savegames, which is heavier than a normal
+# push/PR check should be. Flip this to also run on push/pull_request once
+# the tool has settled down.
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit and regression tests
+        run: go test ./... -v
+
+      - name: Determine latest stable OpenTTD version
+        id: ottd_version
+        run: |
+          curl -sf https://cdn.openttd.org/openttd-releases/latest.yaml -o latest.yaml
+          VERSION=$(awk '/name: stable/{print prev} {prev=$0}' latest.yaml | grep -oE '[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?' | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "could not determine latest stable OpenTTD version from latest.yaml" >&2
+            cat latest.yaml >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Latest stable OpenTTD: $VERSION"
+
+      - name: Download and extract OpenTTD
+        run: |
+          V="${{ steps.ottd_version.outputs.version }}"
+          URL="https://cdn.openttd.org/openttd-releases/$V/openttd-$V-linux-generic-amd64.tar.xz"
+          echo "Downloading $URL"
+          curl -sf "$URL" -o openttd.tar.xz
+          mkdir -p openttd-bin
+          tar -xf openttd.tar.xz -C openttd-bin --strip-components=1
+          echo "$(pwd)/openttd-bin" >> "$GITHUB_PATH"
+
+      - name: Verify OpenTTD binary runs
+        run: |
+          openttd-bin/openttd --version
+
+      - name: Real-load smoke test against every fixture savegame
+        run: |
+          set -e
+          shopt -s nullglob
+          fail=0
+          for f in testdata/*/broken.sav testdata/*/fixed.sav; do
+            echo "== Loading $f =="
+            go run ./cmd/grfdoctor lint "$f" --openttd "$(pwd)/openttd-bin/openttd" --timeout 20 || fail=1
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more fixture savegames failed the real-load smoke test." >&2
+            exit 1
+          fi
