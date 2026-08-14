@@ -9,6 +9,7 @@ import (
 
 	"github.com/kolonuk/ottd-grf-doctor/internal/bananas"
 	"github.com/kolonuk/ottd-grf-doctor/internal/engine"
+	"github.com/kolonuk/ottd-grf-doctor/internal/grf"
 	"github.com/kolonuk/ottd-grf-doctor/internal/sav"
 )
 
@@ -70,6 +71,13 @@ type Model struct {
 	// insertion into the save when the plan is applied.
 	PendingGRFs []engine.NewGRFToInsert
 
+	// Downloaded candidates' dynamically-parsed engine rosters, keyed by
+	// GRFID -- this is what makes matching real instead of requiring the
+	// user to type an internal ID blind: see internal/grf, which reads
+	// each engine's actual track type/dates/speed/power straight from
+	// the GRF binary's Action0 properties (no hardcoded per-GRF table).
+	ParsedCandidates map[string]*grf.ParsedGRF
+
 	Bananas *bananas.Client
 }
 
@@ -117,7 +125,8 @@ func LoadModel(path string) (*Model, error) {
 		Path: path, Save: s, Payload: s.Payload,
 		EIDS: eids, NGRF: ngrf, Vehicles: vehicles, Analysis: an,
 		Year: year, RailLabels: railLabels, Tiles: tiles,
-		Bananas: &bananas.Client{},
+		Bananas:          &bananas.Client{},
+		ParsedCandidates: map[string]*grf.ParsedGRF{},
 	}
 
 	for _, missing := range an.Missing {
@@ -135,6 +144,31 @@ func LoadModel(path string) (*Model, error) {
 	}
 
 	return m, nil
+}
+
+// RailtypeOfParsedEngine maps a dynamically-parsed engine's raw track
+// type property to this tool's Railtype enum, matching OpenTTD's own
+// interpretation (src/newgrf/newgrf_act0_trains.cpp's RailVehicleChangeInfo,
+// case 0x05): 0=rail (or electrified, depending on engine class -- this
+// package doesn't track property 0x19 "engine traction type" yet, so it
+// simplifies to plain Rail; see grf.ParsedEngine's doc comment), 1=mono,
+// 2=maglev, anything else is an index into the GRF's own railtype
+// translation table, which this package doesn't resolve -- reported as
+// Unknown rather than guessed.
+func RailtypeOfParsedEngine(e *grf.ParsedEngine) engine.Railtype {
+	if !e.HasTrackType {
+		return engine.RailtypeUnknown
+	}
+	switch e.TrackType {
+	case 0:
+		return engine.RailtypeRail
+	case 1:
+		return engine.RailtypeMono
+	case 2:
+		return engine.RailtypeMaglev
+	default:
+		return engine.RailtypeUnknown // translated table index -- not resolved (see doc comment)
+	}
 }
 
 // RailtypeAtTile resolves the Railtype actually built under a vehicle's

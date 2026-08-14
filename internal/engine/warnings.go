@@ -40,20 +40,34 @@ func CheckRailtypeCompatibility(actualTrackRailtype, candidateRailtype Railtype)
 	return out
 }
 
-// yearRangeRe pulls a trailing 4-digit year out of free text like "1850-2008
-// year range" or "Available 1970-2010" -- the loose format BaNaNaS
-// descriptions tend to use. Only a best-effort signal; see
-// CheckDateAvailability's doc comment for why this can't be precise.
+// CheckEngineDateAvailability checks whether currentYear falls within
+// [introYear, retireYear) for a specific engine -- exact, not a guess.
+// retireYear == 0 means the engine never retires (see DefaultTrainEngine
+// and, for parsed third-party engines, ParsedEngine).
+func CheckEngineDateAvailability(currentYear, introYear, retireYear int) []Warning {
+	var out []Warning
+	if currentYear < introYear {
+		out = append(out, Warning{Message: fmt.Sprintf(
+			"Not introduced until %d; your save is at %d (%d year(s) early). It won't appear in the purchase list yet.",
+			introYear, currentYear, introYear-currentYear)})
+	} else if retireYear != 0 && currentYear >= retireYear {
+		out = append(out, Warning{Message: fmt.Sprintf(
+			"Retires from the purchase list in %d; your save is at %d (%d year(s) past). It may no longer be buildable.",
+			retireYear, currentYear, currentYear-retireYear+1)})
+	}
+	return out
+}
+
+// yearRangeRe pulls a "startYear-endYear" pattern out of free text like
+// "1850-2008 year range" -- the loose format BaNaNaS descriptions tend
+// to use. This is a LAST-RESORT fallback only, for when a candidate's
+// exact per-engine dates aren't available (e.g. GRF binary parsing
+// couldn't extract them for some property-encoding this tool doesn't
+// handle yet -- see ParseGRF's doc comment); CheckEngineDateAvailability
+// above is exact and should always be preferred when its inputs are known.
 var yearRangeRe = regexp.MustCompile(`(1[89]\d{2}|20\d{2}|21\d{2})\s*[-\x{2013}]\s*(1[89]\d{2}|20\d{2}|21\d{2})`)
 
-// CheckDateAvailability does a best-effort check of whether a candidate
-// GRF's engines are likely to still be buildable at the save's current
-// in-game year, based on a "startYear-endYear" pattern in its
-// description text (common in BaNaNaS listings, e.g. SHARK's "1850-2008
-// year range"). This is NOT the same as reading actual per-engine
-// intro/retirement properties (that needs full GRF binary parsing, out
-// of scope -- see README.md), so it only ever produces a soft warning,
-// never a claim of certainty.
+// CheckDateAvailability is the fallback described above.
 func CheckDateAvailability(currentYear int, descriptionText string) []Warning {
 	m := yearRangeRe.FindStringSubmatch(descriptionText)
 	if m == nil {
@@ -65,7 +79,7 @@ func CheckDateAvailability(currentYear int, descriptionText string) []Warning {
 	}
 	if currentYear > endYear {
 		return []Warning{{Message: fmt.Sprintf(
-			"This GRF's description mentions a year range ending %d; your save is at %d, %d year(s) later. Its newest vehicles may already be past their design lifespan and could show as unavailable/expired in the purchase list. (Best-effort guess from the description text, not exact per-vehicle data -- verify in-game.)",
+			"Exact per-engine dates weren't available, but this GRF's description mentions a year range ending %d; your save is at %d, %d year(s) later. Its newest vehicles may already be past their design lifespan. (Best-effort guess from description text -- verify in-game.)",
 			endYear, currentYear, currentYear-endYear)}}
 	}
 	return nil

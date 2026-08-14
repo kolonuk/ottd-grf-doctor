@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/kolonuk/ottd-grf-doctor/internal/bananas"
 	"github.com/kolonuk/ottd-grf-doctor/internal/engine"
+	"github.com/kolonuk/ottd-grf-doctor/internal/grf"
 	"github.com/kolonuk/ottd-grf-doctor/internal/lint"
 	"github.com/rivo/tview"
 )
@@ -221,8 +223,14 @@ func (a *App) showVehicleDetail(i int) {
 		fmt.Fprint(&b, "\n(Enter to mark this vehicle for removal instead of replacement)\n")
 	}
 	if it.Match != nil {
-		for _, w := range engine.CheckRailtypeCompatibility(rt, replacementRailtype(it.Match)) {
+		candidateRT, hasDate, introYear, retireYear := a.replacementInfo(it.Match)
+		for _, w := range engine.CheckRailtypeCompatibility(rt, candidateRT) {
 			fmt.Fprintf(&b, "\n[orange]Warning:[-] %s\n", w.Message)
+		}
+		if hasDate {
+			for _, w := range engine.CheckEngineDateAvailability(a.model.Year, introYear, retireYear) {
+				fmt.Fprintf(&b, "\n[orange]Warning:[-] %s\n", w.Message)
+			}
 		}
 	}
 	a.vehicleInfo.SetText(b.String())
@@ -251,17 +259,36 @@ func (a *App) refreshLeftLabel() {
 	a.leftList.SetCurrentItem(cur)
 }
 
-// replacementRailtype looks up what's known about a chosen target
-// engine's railtype: the default-engine table if it's a base-game
-// engine, otherwise RailtypeUnknown (third-party GRF properties aren't
-// parsed -- see README.md).
-func replacementRailtype(t *engine.TargetEngine) engine.Railtype {
+// replacementInfo looks up everything known about a chosen target
+// engine: the default-engine table if it's a base-game engine, the
+// dynamically-parsed candidate roster if it's a downloaded third-party
+// GRF this session has parsed (see internal/grf), or nothing if neither
+// -- e.g. an internal ID typed in manually without downloading first.
+func (a *App) replacementInfo(t *engine.TargetEngine) (railtype engine.Railtype, hasDate bool, introYear, retireYear int) {
 	if t.GRFID == engine.InvalidGRFID {
 		if d, ok := engine.DefaultTrainEngines[t.InternalID]; ok {
-			return d.Railtype
+			return d.Railtype, true, d.IntroYear, d.RetireYear
+		}
+		return engine.RailtypeUnknown, false, 0, 0
+	}
+	if parsed, ok := a.model.ParsedCandidates[t.GRFID]; ok {
+		for _, e := range parsed.Engines {
+			if e.LocalID != t.InternalID {
+				continue
+			}
+			rt := RailtypeOfParsedEngine(&e)
+			if !e.HasIntroDate {
+				return rt, false, 0, 0
+			}
+			introYear := grf.DayCountToYear(e.IntroDate)
+			retireYear := 0
+			if e.HasModelLife && e.ModelLife != 255 {
+				retireYear = introYear + int(e.ModelLife)
+			}
+			return rt, true, introYear, retireYear
 		}
 	}
-	return engine.RailtypeUnknown
+	return engine.RailtypeUnknown, false, 0, 0
 }
 
 // --- right panel: replacement browser ------------------------------------
@@ -359,7 +386,18 @@ func (a *App) downloadSelected() {
 				Version:   1,
 				Palette:   9,
 			})
-			a.setStatus(fmt.Sprintf("[green]Downloaded %s -> %s[-] (queued for insertion when you apply)", c.Name, grfPath))
+
+			// Dynamically parse the actual GRF binary so matching can
+			// show real engines (name, track type, dates, speed, power)
+			// instead of asking the user to type an internal ID blind --
+			// see internal/grf.
+			parsed, perr := grf.ParseGRF(grfPath)
+			if perr != nil {
+				a.setStatus(fmt.Sprintf("[green]Downloaded %s[-] but [yellow]couldn't parse its engine list (%v)[-] -- you'll need to enter the internal ID manually when matching", c.Name, perr))
+				return
+			}
+			a.model.ParsedCandidates[c.GRFIDHex()] = parsed
+			a.setStatus(fmt.Sprintf("[green]Downloaded and parsed %s: %d engine(s) found[-] -- ready to match", c.Name, len(parsed.Engines)))
 		})
 	}()
 }
@@ -383,14 +421,90 @@ func (a *App) matchSelectedTo(rightIdx int) {
 	if c == nil {
 		return
 	}
+	if parsed, ok := a.model.ParsedCandidates[c.GRFIDHex()]; ok && len(parsed.Engines) > 0 {
+		a.promptEnginePicker(c, parsed, it)
+		return
+	}
 	a.promptInternalID(c, it)
 }
 
-// promptInternalID asks for the specific engine's internal GRF-local ID
-// within the chosen replacement GRF. This tool does not parse third-party
-// GRF binaries to enumerate their engines (see README.md), so the user
-// supplies this -- typically found in the GRF's own documentation, or by
-// trial in-game.
+// promptEnginePicker shows the replacement GRF's actual, dynamically-
+// parsed engine roster (name, track type, dates, speed/power) and lets
+// the user pick one directly -- no blind internal-ID entry, no
+// hardcoded per-GRF table (see internal/grf). Each row shows a
+// railtype/date warning inline when this tool has enough data to know
+// there's a mismatch (see internal/engine/warnings.go); these are
+// informational only, matching every other warning in this tool.
+func (a *App) promptEnginePicker(c *bananas.ContentInfo, parsed *grf.ParsedGRF, it *Item) {
+	var trackAt engine.Railtype
+	if len(it.Vehicles) > 0 {
+		trackAt = a.model.RailtypeAtTile(it.Vehicles[0].Tile)
+	}
+
+	list := tview.NewList().ShowSecondaryText(true)
+	engines := append([]grf.ParsedEngine(nil), parsed.Engines...)
+	sort.Slice(engines, func(i, j int) bool { return engines[i].LocalID < engines[j].LocalID })
+	for i := range engines {
+		e := &engines[i]
+		var warn []string
+		candidateRT := RailtypeOfParsedEngine(e)
+		for _, w := range engine.CheckRailtypeCompatibility(trackAt, candidateRT) {
+			warn = append(warn, w.Message)
+		}
+		if e.HasIntroDate {
+			introYear := grf.DayCountToYear(e.IntroDate)
+			retireYear := 0
+			if e.HasModelLife && e.ModelLife != 255 {
+				retireYear = introYear + int(e.ModelLife)
+			}
+			for _, w := range engine.CheckEngineDateAvailability(a.model.Year, introYear, retireYear) {
+				warn = append(warn, w.Message)
+			}
+		}
+		sec := fmt.Sprintf("id=%d", e.LocalID)
+		if e.HasTrackType {
+			sec += "  track=" + candidateRT.String()
+		}
+		if e.HasIntroDate {
+			sec += fmt.Sprintf("  intro=%d", grf.DayCountToYear(e.IntroDate))
+		}
+		if e.HasSpeed {
+			sec += fmt.Sprintf("  speed=%d", e.Speed)
+		}
+		if e.HasPower {
+			sec += fmt.Sprintf("  power=%d", e.Power)
+		}
+		if len(warn) > 0 {
+			sec += "  [orange]! " + strings.Join(warn, "; ") + "[-]"
+		}
+		list.AddItem(e.Name, sec, 0, nil)
+	}
+
+	pages := tview.NewPages()
+	list.SetSelectedFunc(func(i int, main, sec string, sc rune) {
+		e := engines[i]
+		it.Match = &engine.TargetEngine{GRFID: c.GRFIDHex(), InternalID: e.LocalID, Name: e.Name}
+		a.renderGRFDetail()
+		a.populateVehicleList()
+		a.refreshLeftLabel()
+		a.tapp.SetRoot(a.rootLayout(), true).SetFocus(a.leftList)
+	})
+	list.SetBorder(true).SetTitle(fmt.Sprintf(" Match %s -> pick engine in %s (Esc to cancel) ", it.GRFID, c.Name))
+	list.SetDoneFunc(func() {
+		a.tapp.SetRoot(a.rootLayout(), true).SetFocus(a.rightList)
+	})
+	modal := center(list, 100, 24)
+	pages.AddPage("background", a.rootLayout(), true, true)
+	pages.AddPage("modal", modal, true, true)
+	a.tapp.SetRoot(pages, true).SetFocus(list)
+}
+
+// promptInternalID is the fallback when a candidate GRF hasn't been
+// downloaded (and therefore dynamically parsed) yet: it asks for the
+// specific engine's internal GRF-local ID directly. Download the GRF
+// first (see downloadSelected) to get the real engine-picker experience
+// instead -- this is typically found in the GRF's own documentation, or
+// by trial in-game.
 func (a *App) promptInternalID(c *bananas.ContentInfo, it *Item) {
 	form := tview.NewForm()
 	idField := tview.NewInputField().SetLabel("Internal engine ID in " + c.Name + ": ").SetText("0")
