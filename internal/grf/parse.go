@@ -37,7 +37,7 @@ func ParseGRF(path string) (*ParsedGRF, error) {
 	}
 	sprites, err := walkContainer2(data)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 
 	engines := map[uint16]*ParsedEngine{}

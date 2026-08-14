@@ -47,7 +47,11 @@ func walkContainer2(data []byte) ([]PseudoSprite, error) {
 		return nil, fmt.Errorf("file too short to be a container-2 GRF")
 	}
 	if data[0] != 0 || data[1] != 0 {
-		return nil, fmt.Errorf("not container format 2 (missing 00 00 preamble) -- container format 1 is not supported")
+		return nil, fmt.Errorf("this GRF uses the old container format 1 (no \"00 00\" preamble at the " +
+			"start of the file), which this tool's dynamic parser does not support -- only container " +
+			"format 2 (the format every GRF compiler has produced by default since around 2012) is " +
+			"implemented. You can still match this GRF manually: cancel this and use the raw internal " +
+			"ID entry instead, or recompile/convert the GRF to container format 2 with grfcodec/NML first")
 	}
 	if string(data[2:10]) != string(container2Signature) {
 		return nil, fmt.Errorf("not a valid NewGRF: signature mismatch")

@@ -46,6 +46,21 @@ type App struct {
 	modalOpen          bool
 	modalDismissAnyKey bool
 	modalClose         func()
+
+	// showAllTracks, toggled by 't' while the right-hand list has focus,
+	// disables candidateMatches' track-compatibility filter (see its doc
+	// comment) so already-downloaded-and-parsed candidates with no
+	// track-matching engine show up again instead of being hidden.
+	showAllTracks bool
+
+	// dirty tracks whether there's matching/removal work that hasn't
+	// been applied+saved yet -- set whenever a match or removal is made,
+	// cleared on a successful applyAndSave. Standard "unsaved changes"
+	// TUI convention: quitting (q/Esc/Ctrl-X) asks for confirmation
+	// while dirty instead of silently discarding the session's work.
+	// Ctrl-C is deliberately left as tview's unconditional hard-quit, as
+	// is conventional for terminal apps.
+	dirty bool
 }
 
 // NewApp builds the App around an already-loaded Model.
@@ -58,6 +73,7 @@ func NewApp(m *Model) *App {
 // Run starts the terminal UI event loop; it blocks until the user quits.
 func (a *App) Run() error {
 	go a.loadCatalog()
+	a.tapp.EnableMouse(true)
 	return a.tapp.SetRoot(a.rootLayout(), true).SetFocus(a.leftList).Run()
 }
 
@@ -236,8 +252,12 @@ func (a *App) renderGRFDetail() {
 		if it.ObjectMatch != nil {
 			fmt.Fprintf(&b, "\n[green]Matched to:[-] grfid=%s entity_id=%d\n", it.ObjectMatch.TargetGRFID, it.ObjectMatch.TargetEntity)
 		} else {
-			fmt.Fprintf(&b, "\n[gray]Not matched yet.[-] Select a replacement on the right and press Enter.\n")
-			fmt.Fprintf(&b, "[gray]Object matching is best-effort: unresolved slots are left as-is rather than blocking the rest of the fix.[-]\n")
+			fmt.Fprint(&b, "\n[gray]Not matched yet.[-] To fix:\n"+
+				"[gray] 1.[-] Tab to [yellow]Replacement candidates[-] (right) and search/browse --\n"+
+				"    only GRFs tagged \"object\" are shown\n"+
+				"[gray] 2.[-] Press [yellow]d[-] to download and parse it\n"+
+				"[gray] 3.[-] Press [yellow]Enter[-] on it to pick a specific object\n")
+			fmt.Fprint(&b, "[gray]Object matching is best-effort: unresolved slots are left as-is rather than blocking the rest of the fix.[-]\n")
 		}
 	} else if it.Broken {
 		fmt.Fprintf(&b, "[red]Status: BROKEN[-] -- this GRF is referenced by the save but not loaded.\n")
@@ -246,7 +266,13 @@ func (a *App) renderGRFDetail() {
 		if it.Match != nil {
 			fmt.Fprintf(&b, "\n[green]Matched to:[-] %s (grfid=%s internal_id=%d)\n", it.Match.Name, it.Match.GRFID, it.Match.InternalID)
 		} else {
-			fmt.Fprintf(&b, "\n[gray]Not matched yet.[-] Select a replacement on the right and press Enter.\n")
+			fmt.Fprint(&b, "\n[gray]Not matched yet.[-] To fix:\n"+
+				"[gray] 1.[-] Tab to [yellow]Replacement candidates[-] (right) and search/browse --\n"+
+				"    only GRFs tagged \"train\" are shown\n"+
+				"[gray] 2.[-] Press [yellow]d[-] to download and parse it (or skip this and\n"+
+				"    press Enter directly if you already know the internal ID)\n"+
+				"[gray] 3.[-] Press [yellow]Enter[-] on it to open the engine picker, compared\n"+
+				"    side-by-side against what this vehicle currently looks like\n")
 		}
 		if n := len(it.RemovedVehIDs); n > 0 {
 			fmt.Fprintf(&b, "%d vehicle(s) marked for removal instead of replacement.\n", n)
@@ -314,6 +340,20 @@ func (a *App) showVehicleDetail(i int) {
 	fmt.Fprintf(&b, "[yellow]Tile:[-] %d\n", v.Tile)
 	rt := a.model.RailtypeAtTile(v.Tile)
 	fmt.Fprintf(&b, "[yellow]Track here:[-] %s\n", rt)
+	// The vehicle's TRUE original engine (whatever the missing GRF
+	// defined) can't be recovered -- but OpenTTD substitutes the closest
+	// base-game default engine so it still renders as something, and
+	// that substitute's real stats are a reasonable proxy for "what this
+	// looks like right now" to compare replacement candidates against.
+	if sub, ok := engine.SubstituteEngineFor(a.model.EIDS, v.EngineType); ok {
+		fmt.Fprintf(&b, "[yellow]Currently displayed as:[-] %s (speed=%d power=%d", sub.Name, sub.Speed, sub.Power)
+		if sub.RetireYear != 0 {
+			fmt.Fprintf(&b, " intro=%d retire=%d", sub.IntroYear, sub.RetireYear)
+		} else {
+			fmt.Fprintf(&b, " intro=%d never retires", sub.IntroYear)
+		}
+		fmt.Fprint(&b, ")\n")
+	}
 	if it.RemovedVehIDs[v.VehicleID] {
 		fmt.Fprint(&b, "\n[red]Marked for removal[-] (Enter to undo)\n")
 	} else {
@@ -365,6 +405,7 @@ func (a *App) toggleRemoveVehicle(i int) {
 	} else {
 		it.RemovedVehIDs[id] = true
 	}
+	a.dirty = true
 	a.populateVehicleList()
 	a.vehicleList.SetCurrentItem(i)
 	a.renderGRFDetail()
@@ -436,6 +477,16 @@ func (a *App) loadCatalog() {
 // vehicles and "object" for scenery -- this tool only detects/fixes
 // broken train and object GRFs (see internal/engine's scope), so those
 // are the only two categories ever requested here.
+//
+// A second, narrower filter applies on top of the tag check: if a
+// candidate has already been downloaded and parsed this session (see
+// downloadSelected), and NONE of its engines' track types match the
+// broken vehicle's actual current track, it's hidden too -- unless
+// showAllTracks is set ('t' while the right list has focus). This can
+// only apply to already-parsed candidates: the catalog itself carries no
+// per-engine track data, so an un-downloaded GRF's track compatibility
+// genuinely can't be known ahead of time and is never filtered on that
+// basis alone.
 func (a *App) candidateMatches(c *bananas.ContentInfo, query string) bool {
 	wantTag := "train"
 	if a.selectedItem != nil && a.selectedItem.Kind == KindObjectGRF {
@@ -452,18 +503,36 @@ func (a *App) candidateMatches(c *bananas.ContentInfo, query string) bool {
 		return false
 	}
 	q := strings.ToLower(strings.TrimSpace(query))
-	if q == "" {
-		return true
+	if q != "" && !strings.Contains(strings.ToLower(c.Name), q) && !strings.Contains(strings.ToLower(c.Desc), q) {
+		return false
 	}
-	return strings.Contains(strings.ToLower(c.Name), q) || strings.Contains(strings.ToLower(c.Desc), q)
+	if wantTag == "train" && !a.showAllTracks && a.selectedItem != nil && len(a.selectedItem.Vehicles) > 0 {
+		if parsed, ok := a.model.ParsedCandidates[c.GRFIDHex()]; ok {
+			trackAt := a.model.RailtypeAtTile(a.selectedItem.Vehicles[0].Tile)
+			anyCompatible := false
+			for i := range parsed.Engines {
+				if engineTrackCompatible(trackAt, RailtypeOfParsedEngine(&parsed.Engines[i])) {
+					anyCompatible = true
+					break
+				}
+			}
+			if !anyCompatible {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (a *App) filterCatalog(query string) {
 	a.rightList.Clear()
-	shown := 0
+	shown, hiddenByTrack := 0, 0
 	for i := range a.catalog {
 		c := &a.catalog[i]
 		if !a.candidateMatches(c, query) {
+			if _, parsed := a.model.ParsedCandidates[c.GRFIDHex()]; parsed && !a.showAllTracks {
+				hiddenByTrack++
+			}
 			continue
 		}
 		sec := fmt.Sprintf("grfid=%s v%s", c.GRFIDHex(), c.Version)
@@ -473,6 +542,13 @@ func (a *App) filterCatalog(query string) {
 			break // keep the list responsive; narrow the search for more
 		}
 	}
+	title := " Replacement candidates "
+	if a.showAllTracks {
+		title = " Replacement candidates [showing all tracks, 't' to filter] "
+	} else if hiddenByTrack > 0 {
+		title = fmt.Sprintf(" Replacement candidates [%d hidden by track mismatch, 't' to show] ", hiddenByTrack)
+	}
+	a.rightList.SetTitle(title)
 	if a.tapp.GetFocus() == a.rightList {
 		a.showCandidateDetail(a.rightList.GetCurrentItem())
 	}
@@ -546,12 +622,12 @@ func (a *App) downloadSelected() {
 		files, err := a.model.Bananas.Download(ctx, c.ContentID, destDir)
 		a.tapp.QueueUpdateDraw(func() {
 			if err != nil {
-				a.setStatus(fmt.Sprintf("[red]Download failed: %v[-]", err))
+				a.showError("Download failed", fmt.Sprintf("Couldn't download %s:\n\n%v", c.Name, err))
 				return
 			}
 			grfPath := findGRFFile(files)
 			if grfPath == "" {
-				a.setStatus("[red]Downloaded, but no .grf file found in the package[-]")
+				a.showError("Download failed", fmt.Sprintf("Downloaded %s, but the package contained no .grf file.", c.Name))
 				return
 			}
 			// ApplyToPayload/insertNGRF hashes the file itself when the
@@ -571,11 +647,15 @@ func (a *App) downloadSelected() {
 			// see internal/grf.
 			parsed, perr := grf.ParseGRF(grfPath)
 			if perr != nil {
-				a.setStatus(fmt.Sprintf("[green]Downloaded %s[-] but [yellow]couldn't parse its engine list (%v)[-] -- you'll need to enter the internal ID manually when matching", c.Name, perr))
+				a.setStatus(fmt.Sprintf("[green]Downloaded %s[-] but [yellow]couldn't parse its engine list[-] -- see popup for details", c.Name))
+				a.showError("Couldn't parse "+c.Name,
+					fmt.Sprintf("%v\n\nThe download itself succeeded and is queued to insert into the save -- "+
+						"you can still match it manually (Enter on it will ask for the internal engine ID directly).", perr))
 				return
 			}
 			a.model.ParsedCandidates[c.GRFIDHex()] = parsed
 			a.setStatus(fmt.Sprintf("[green]Downloaded and parsed %s: %d engine(s) found[-] -- ready to match", c.Name, len(parsed.Engines)))
+			a.filterCatalog(a.searchInput.GetText()) // a newly-parsed candidate can now be track-filtered
 		})
 	}()
 }
@@ -690,6 +770,7 @@ func (a *App) promptObjectPicker(c *bananas.ContentInfo, parsed *grf.ParsedGRF, 
 			return
 		}
 		it.ObjectMatch = &engine.ObjectAssignment{Slots: it.ObjectSlots, TargetGRFID: c.GRFIDHex(), TargetEntity: entity}
+		a.dirty = true
 		a.renderGRFDetail()
 		a.refreshLeftItemLabel(a.leftList.GetCurrentItem())
 		a.closeModal(a.leftList)
@@ -698,69 +779,152 @@ func (a *App) promptObjectPicker(c *bananas.ContentInfo, parsed *grf.ParsedGRF, 
 	a.openModal(center(list, 100, 24), list, a.rightList, false)
 }
 
+// engineTrackCompatible reports whether a candidate engine's track type
+// is known to be usable on the vehicle's actual track. Deliberately more
+// permissive than CheckRailtypeCompatibility's warning trigger (which
+// also flags an *unknown* candidate track as worth a warning): here,
+// "unknown" on either side means "can't judge" and stays visible by
+// default, only a confirmed mismatch between two known railtypes is
+// filtered out -- see promptEnginePicker's 't' toggle for seeing those
+// too.
+func engineTrackCompatible(actual, candidate engine.Railtype) bool {
+	if actual == engine.RailtypeUnknown || candidate == engine.RailtypeUnknown {
+		return true
+	}
+	return actual == candidate
+}
+
 // promptEnginePicker shows the replacement GRF's actual, dynamically-
 // parsed engine roster (name, track type, dates, speed/power) and lets
 // the user pick one directly -- no blind internal-ID entry, no
-// hardcoded per-GRF table (see internal/grf). Each row shows a
-// railtype/date warning inline when this tool has enough data to know
-// there's a mismatch (see internal/engine/warnings.go); these are
-// informational only, matching every other warning in this tool.
+// hardcoded per-GRF table (see internal/grf). A header above the list
+// shows what the broken vehicle currently displays as (its EIDS
+// substitute default engine, see engine.SubstituteEngineFor) for a
+// side-by-side comparison against each candidate row's own speed/power/
+// dates. By default only engines whose track type matches the broken
+// vehicle's actual track are listed (or every engine, if either side's
+// track type isn't known) -- 't' toggles showing the full roster,
+// including confirmed mismatches, with the same inline warning tags
+// promptEnginePicker has always shown for those.
 func (a *App) promptEnginePicker(c *bananas.ContentInfo, parsed *grf.ParsedGRF, it *Item) {
 	var trackAt engine.Railtype
+	var repVehicle *engine.TrainVehicle
 	if len(it.Vehicles) > 0 {
-		trackAt = a.model.RailtypeAtTile(it.Vehicles[0].Tile)
+		repVehicle = &it.Vehicles[0]
+		trackAt = a.model.RailtypeAtTile(repVehicle.Tile)
 	}
+
+	header := tview.NewTextView().SetDynamicColors(true).SetWrap(true)
+	header.SetBorder(true).SetTitle(" Comparison ")
+	if repVehicle != nil {
+		var h strings.Builder
+		fmt.Fprintf(&h, "[yellow]This save's track here:[-] %s   [yellow]Cargo:[-] type %d, capacity %d   [yellow]Affected vehicles:[-] %d\n",
+			trackAt, repVehicle.CargoType, repVehicle.CargoCap, len(it.Vehicles))
+		if sub, ok := engine.SubstituteEngineFor(a.model.EIDS, repVehicle.EngineType); ok {
+			retire := fmt.Sprintf("retire=%d", sub.RetireYear)
+			if sub.RetireYear == 0 {
+				retire = "never retires"
+			}
+			fmt.Fprintf(&h, "[yellow]Currently displayed as:[-] %s -- track=%s speed=%d power=%d intro=%d %s",
+				sub.Name, sub.Railtype, sub.Speed, sub.Power, sub.IntroYear, retire)
+		} else {
+			fmt.Fprint(&h, "[gray]No current-engine data available for comparison.[-]")
+		}
+		header.SetText(h.String())
+	}
+
+	engines := append([]grf.ParsedEngine(nil), parsed.Engines...)
+	sort.Slice(engines, func(i, j int) bool { return engines[i].LocalID < engines[j].LocalID })
 
 	list := tview.NewList().ShowSecondaryText(true)
 	list.SetWrapAround(false)
-	engines := append([]grf.ParsedEngine(nil), parsed.Engines...)
-	sort.Slice(engines, func(i, j int) bool { return engines[i].LocalID < engines[j].LocalID })
-	for i := range engines {
-		e := &engines[i]
-		var warn []string
-		candidateRT := RailtypeOfParsedEngine(e)
-		for _, w := range engine.CheckRailtypeCompatibility(trackAt, candidateRT) {
-			warn = append(warn, w.Message)
-		}
-		if e.HasIntroDate {
-			introYear := grf.DayCountToYear(e.IntroDate)
-			retireYear := 0
-			if e.HasModelLife && e.ModelLife != 255 {
-				retireYear = introYear + int(e.ModelLife)
+
+	showAll := false
+	var shown []grf.ParsedEngine
+	render := func() {
+		list.Clear()
+		shown = shown[:0]
+		hidden := 0
+		for i := range engines {
+			e := &engines[i]
+			candidateRT := RailtypeOfParsedEngine(e)
+			if !showAll && !engineTrackCompatible(trackAt, candidateRT) {
+				hidden++
+				continue
 			}
-			for _, w := range engine.CheckEngineDateAvailability(a.model.Year, introYear, retireYear) {
+			shown = append(shown, *e)
+
+			var warn []string
+			for _, w := range engine.CheckRailtypeCompatibility(trackAt, candidateRT) {
 				warn = append(warn, w.Message)
 			}
+			if e.HasIntroDate {
+				introYear := grf.DayCountToYear(e.IntroDate)
+				retireYear := 0
+				if e.HasModelLife && e.ModelLife != 255 {
+					retireYear = introYear + int(e.ModelLife)
+				}
+				for _, w := range engine.CheckEngineDateAvailability(a.model.Year, introYear, retireYear) {
+					warn = append(warn, w.Message)
+				}
+			}
+			sec := fmt.Sprintf("id=%d", e.LocalID)
+			if e.HasTrackType {
+				sec += "  track=" + candidateRT.String()
+			}
+			if e.HasIntroDate {
+				sec += fmt.Sprintf("  intro=%d", grf.DayCountToYear(e.IntroDate))
+			}
+			if e.HasSpeed {
+				sec += fmt.Sprintf("  speed=%d", e.Speed)
+			}
+			if e.HasPower {
+				sec += fmt.Sprintf("  power=%d", e.Power)
+			}
+			if len(warn) > 0 {
+				sec += "  [orange]! " + strings.Join(warn, "; ") + "[-]"
+			}
+			list.AddItem(e.Name, sec, 0, nil)
 		}
-		sec := fmt.Sprintf("id=%d", e.LocalID)
-		if e.HasTrackType {
-			sec += "  track=" + candidateRT.String()
+		title := fmt.Sprintf(" Match %s -> pick engine in %s ", it.GRFID, c.Name)
+		if showAll {
+			title += fmt.Sprintf("[showing all %d, 't' for track-matches only] ", len(engines))
+		} else if hidden > 0 {
+			title += fmt.Sprintf("[%d hidden by track mismatch, 't' to show all] ", hidden)
 		}
-		if e.HasIntroDate {
-			sec += fmt.Sprintf("  intro=%d", grf.DayCountToYear(e.IntroDate))
-		}
-		if e.HasSpeed {
-			sec += fmt.Sprintf("  speed=%d", e.Speed)
-		}
-		if e.HasPower {
-			sec += fmt.Sprintf("  power=%d", e.Power)
-		}
-		if len(warn) > 0 {
-			sec += "  [orange]! " + strings.Join(warn, "; ") + "[-]"
-		}
-		list.AddItem(e.Name, sec, 0, nil)
+		title += "(Esc to cancel) "
+		list.SetTitle(title)
 	}
+	render()
 
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Rune() == 't' {
+			showAll = !showAll
+			cur := list.GetCurrentItem()
+			render()
+			list.SetCurrentItem(cur)
+			return nil
+		}
+		return event
+	})
 	list.SetSelectedFunc(func(i int, main, sec string, sc rune) {
-		e := engines[i]
+		if i < 0 || i >= len(shown) {
+			return
+		}
+		e := shown[i]
 		it.Match = &engine.TargetEngine{GRFID: c.GRFIDHex(), InternalID: e.LocalID, Name: e.Name}
+		a.dirty = true
 		a.renderGRFDetail()
 		a.populateVehicleList()
 		a.refreshLeftItemLabel(a.leftList.GetCurrentItem())
 		a.closeModal(a.leftList)
 	})
-	list.SetBorder(true).SetTitle(fmt.Sprintf(" Match %s -> pick engine in %s (Esc to cancel) ", it.GRFID, c.Name))
-	a.openModal(center(list, 100, 24), list, a.rightList, false)
+	list.SetBorder(true)
+
+	flex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(header, 5, 0, false).
+		AddItem(list, 0, 1, true)
+	a.openModal(center(flex, 110, 30), list, a.rightList, false)
 }
 
 // promptInternalID is the fallback when a candidate GRF hasn't been
@@ -790,6 +954,7 @@ func (a *App) promptInternalID(c *bananas.ContentInfo, it *Item) {
 			return
 		}
 		it.Match = &engine.TargetEngine{GRFID: c.GRFIDHex(), InternalID: uint16(id), Name: c.Name}
+		a.dirty = true
 		for _, w := range engine.CheckDateAvailability(a.model.Year, c.Desc) {
 			a.setStatus(fmt.Sprintf("[orange]Warning:[-] %s", w.Message))
 		}
@@ -848,11 +1013,17 @@ func (a *App) globalKeys(event *tcell.EventKey) *tcell.EventKey {
 
 	switch event.Rune() {
 	case 'q':
-		a.tapp.Stop()
+		a.confirmQuit()
 		return nil
 	case 'd':
 		if a.tapp.GetFocus() == a.rightList {
 			a.downloadSelected()
+			return nil
+		}
+	case 't':
+		if a.tapp.GetFocus() == a.rightList {
+			a.showAllTracks = !a.showAllTracks
+			a.filterCatalog(a.searchInput.GetText())
 			return nil
 		}
 	case 'A':
@@ -871,10 +1042,37 @@ func (a *App) globalKeys(event *tcell.EventKey) *tcell.EventKey {
 		a.cycleFocus()
 		return nil
 	case tcell.KeyEscape, tcell.KeyCtrlX:
-		a.tapp.Stop()
+		a.confirmQuit()
 		return nil
 	}
 	return event
+}
+
+// confirmQuit quits immediately if there's nothing unapplied to lose;
+// otherwise it asks first ('y' to quit anyway, 'n'/Escape to go back) --
+// standard "unsaved changes" behavior, since matching/removal work only
+// becomes durable once 'A' (apply+lint+save) has run.
+func (a *App) confirmQuit() {
+	if !a.dirty {
+		a.tapp.Stop()
+		return
+	}
+	returnTo := a.tapp.GetFocus()
+	text := tview.NewTextView().SetDynamicColors(true).SetWrap(true)
+	text.SetBorder(true).SetTitle(" Quit without applying? ")
+	text.SetText("[yellow]You have matches or removals set that haven't been applied yet[-]\n" +
+		"(press 'A' on the main screen to apply, lint, and save them first).\n\n" +
+		"Quit anyway and lose them?  [green]y[-]/[red]n[-]")
+	text.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Rune() {
+		case 'y', 'Y':
+			a.tapp.Stop()
+		case 'n', 'N':
+			a.closeModal(returnTo)
+		}
+		return nil // swallow everything else while this prompt is up
+	})
+	a.openModal(center(text, 70, 9), text, returnTo, false)
 }
 
 func (a *App) cycleFocus() {
@@ -904,7 +1102,7 @@ func (a *App) updateStatusHelp() {
 	case a.searchInput:
 		a.setStatus("[yellow]Tab[-] next panel  type to search candidates  [yellow]Esc/Ctrl-C[-] quit")
 	case a.rightList:
-		a.setStatus("[yellow]Tab[-] next panel  [yellow]↑↓[-] browse candidates  [yellow]Enter[-] match  [yellow]d[-] download" + common)
+		a.setStatus("[yellow]Tab[-] next panel  [yellow]↑↓[-] browse candidates  [yellow]Enter[-] match  [yellow]d[-] download  [yellow]t[-] toggle track filter" + common)
 	default:
 		a.setStatus("[yellow]?[-] help" + common)
 	}
@@ -916,13 +1114,35 @@ const helpText = `[yellow::b]grfdoctor -- keybindings[-::-]
 [yellow]Tab[-]              Switch between panels (left GRFs, affected vehicles/objects, search box, replacement candidates)
 [yellow]Up/Down[-]         Move within the focused list (stops at the ends -- no wraparound)
 [yellow]Enter[-]           Context-dependent:
-                    - on a Replacement candidate: match it to the selected broken GRF
+                    - on a Replacement candidate: open the engine/object picker to match it
+                      to the selected broken GRF
                     - on an Affected Vehicle: toggle it for removal instead of replacement
 [yellow]d[-]                Download and parse the highlighted replacement candidate (right panel only)
+[yellow]t[-]                Toggle track-mismatch filtering (right panel, and inside the engine picker) --
+                    by default, candidates/engines with no engine matching this vehicle's
+                    actual track are hidden; 't' shows them anyway
 [yellow]A[-]                Apply the current plan, lint the result, and write a new save file (never overwrites the original)
 [yellow]?[-] or [yellow]h[-]           Show this help screen
-[yellow]Esc[-]              Close a popup if one is open, otherwise quit
-[yellow]Ctrl-C[-], [yellow]Ctrl-X[-], [yellow]q[-]  Quit
+[yellow]Esc[-]              Close a popup if one is open, otherwise quit (asks first if you have
+                    unapplied matches/removals)
+[yellow]Ctrl-C[-]            Quit immediately, no confirmation (the usual terminal "just stop" key)
+[yellow]Ctrl-X[-], [yellow]q[-]        Quit (asks first if you have unapplied matches/removals)
+Mouse               Click to select/focus; scroll to move within a list
+
+[yellow::b]Fixing a broken train GRF, step by step[-::-]
+
+ 1. Select the broken GRF on the left (red "!") -- its affected vehicles and pool slots
+    show in the centre and bottom-centre panes.
+ 2. Tab to Replacement candidates (right) and search/browse for a suitable train set --
+    only GRFs tagged "train" are ever shown, and once you've downloaded one, ones with
+    no track-compatible engine at all drop out too (see 't' above).
+ 3. Press [yellow]d[-] to download and parse the candidate -- this reads its real engine list
+    (names, track type, dates, speed, power) straight from the .grf file.
+ 4. Press [yellow]Enter[-] on it: the engine picker opens with a comparison header showing what
+    the broken vehicle currently displays as (its substitute default engine's stats),
+    so you can pick a real like-for-like replacement instead of guessing.
+ 5. Repeat for every broken GRF, then press [yellow]A[-] to apply, lint, and write a new save file --
+    your original is never modified.
 
 [yellow::b]Panels[-::-]
 
@@ -934,7 +1154,8 @@ const helpText = `[yellow::b]grfdoctor -- keybindings[-::-]
                           follows whichever list has focus.
 [yellow]Affected Vehicles[-]         Vehicles (or, for [OBJ] items, placed instances) that used the
                           selected broken GRF.
-[yellow]Vehicle Detail[-]             Detail of the highlighted vehicle/instance, plus any railtype or
+[yellow]Vehicle Detail[-]             Detail of the highlighted vehicle/instance -- including what it
+                          currently displays as (see step 4 above) -- plus any railtype or
                           in-game-date compatibility warnings against the current match.
 [yellow]Replacement candidates[-]     The BaNaNaS catalog, filtered to GRFs tagged for the selected
                           item's kind (trains for a vehicle GRF, objects for an object GRF) --
@@ -947,6 +1168,9 @@ within a NOT-YET-DOWNLOADED GRF file (set by that GRF's own author) -- it has no
 with this save. Download the candidate first ('d') to get a real, named list to pick from
 instead of typing that number blind.
 
+Some older GRFs use "container format 1", which this tool's parser doesn't read -- you'll
+see a clear popup explaining that if it happens, and can still match manually via internal ID.
+
 [gray](press any key to close)[-]`
 
 // showHelp shows a full-screen keybinding reference, dismissed by any
@@ -957,6 +1181,18 @@ func (a *App) showHelp() {
 	text.SetBorder(true).SetTitle(" Help ")
 	text.SetText(helpText)
 	a.openModal(text, text, returnTo, true)
+}
+
+// showError shows a dismissible, full-detail error popup for failures
+// with more to explain than the one-line status bar can hold clearly
+// without truncating -- e.g. a container-format-1 GRF's explanation of
+// what that means and what to do instead. Dismissed by any key.
+func (a *App) showError(title, detail string) {
+	returnTo := a.tapp.GetFocus()
+	text := tview.NewTextView().SetDynamicColors(true).SetWrap(true)
+	text.SetBorder(true).SetTitle(" " + title + " ")
+	text.SetText("[red]" + detail + "[-]\n\n[gray](press any key to close)[-]")
+	a.openModal(center(text, 90, 16), text, returnTo, true)
 }
 
 func shorten(s string, n int) string {
@@ -1055,6 +1291,7 @@ func (a *App) applyAndSave() {
 		a.setStatus(fmt.Sprintf("[red]Write failed: %v[-]", err))
 		return
 	}
+	a.dirty = false // the plan is now durably on disk at outPath regardless of the lint result below
 
 	report, err := lint.Lint(outPath)
 	if err != nil {
