@@ -22,7 +22,7 @@ type ItemKind int
 
 const (
 	KindVehicleGRF ItemKind = iota
-	KindObjectGRF           // reserved for future scenery/station-object support
+	KindObjectGRF           // scenery/station-object support -- see ObjectSlots/ObjectInstances/ObjectMatch
 )
 
 // Item is one row in the left-hand list: either a missing GRF (broken,
@@ -32,9 +32,18 @@ type Item struct {
 	GRFID  string
 	Broken bool
 
-	// Populated for broken items from engine.Analyze.
+	// Populated for broken vehicle items from engine.Analyze.
 	Slots    []int
 	Vehicles []engine.TrainVehicle
+
+	// Populated for broken object items from engine.Analyze. Object pool
+	// slots (ObjectType) are stable identifiers OBJS instances reference
+	// directly, so fixing them is a direct OBID repoint -- see
+	// engine.ApplyObjectSwaps -- rather than the vehicle-style
+	// slot-reallocation Match/RemovedVehIDs below drive.
+	ObjectSlots     []int
+	ObjectInstances []engine.ObjectInstance
+	ObjectMatch     *engine.ObjectAssignment
 
 	// Populated for loaded items from engine.NGRFEntry.
 	Loaded *engine.NGRFEntry
@@ -45,6 +54,9 @@ type Item struct {
 }
 
 func (it *Item) Matched() bool {
+	if it.Kind == KindObjectGRF {
+		return it.ObjectMatch != nil
+	}
 	return it.Match != nil || (it.Broken && len(it.RemovedVehIDs) == len(it.Vehicles) && len(it.Vehicles) > 0)
 }
 
@@ -59,6 +71,8 @@ type Model struct {
 	EIDS     []engine.EIDSEntry
 	NGRF     []engine.NGRFEntry
 	Vehicles []engine.TrainVehicle
+	OBID     []engine.ObjectTypeEntry
+	Objects  []engine.ObjectInstance
 	Analysis *engine.Analysis
 
 	Year       int
@@ -106,7 +120,22 @@ func LoadModel(path string) (*Model, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing VEHS: %w", err)
 	}
-	an := engine.Analyze(eids, ngrf, vehicles)
+	// OBID/OBJS (object/scenery GRF mapping) are optional -- older or
+	// unusual saves might lack them entirely; treat that as "no objects"
+	// rather than failing the whole load.
+	var obid []engine.ObjectTypeEntry
+	var objs []engine.ObjectInstance
+	if c, ok := cm["OBID"]; ok {
+		if obid, err = engine.ParseOBID(s.Payload, c); err != nil {
+			return nil, fmt.Errorf("parsing OBID: %w", err)
+		}
+	}
+	if c, ok := cm["OBJS"]; ok {
+		if objs, err = engine.ParseOBJS(s.Payload, c); err != nil {
+			return nil, fmt.Errorf("parsing OBJS: %w", err)
+		}
+	}
+	an := engine.Analyze(eids, ngrf, vehicles, obid, objs)
 
 	year, err := engine.ParseInGameYear(s.Payload, cm["DATE"])
 	if err != nil {
@@ -123,7 +152,7 @@ func LoadModel(path string) (*Model, error) {
 
 	m := &Model{
 		Path: path, Save: s, Payload: s.Payload,
-		EIDS: eids, NGRF: ngrf, Vehicles: vehicles, Analysis: an,
+		EIDS: eids, NGRF: ngrf, Vehicles: vehicles, OBID: obid, Objects: objs, Analysis: an,
 		Year: year, RailLabels: railLabels, Tiles: tiles,
 		Bananas:          &bananas.Client{},
 		ParsedCandidates: map[string]*grf.ParsedGRF{},
@@ -134,6 +163,12 @@ func LoadModel(path string) (*Model, error) {
 			Kind: KindVehicleGRF, GRFID: missing.GRFID, Broken: true,
 			Slots: missing.Slots, Vehicles: missing.Vehicles,
 			RemovedVehIDs: map[int]bool{},
+		})
+	}
+	for _, missingObj := range an.MissingObjects {
+		m.Items = append(m.Items, &Item{
+			Kind: KindObjectGRF, GRFID: missingObj.GRFID, Broken: true,
+			ObjectSlots: missingObj.Slots, ObjectInstances: missingObj.Instances,
 		})
 	}
 	for i := range ngrf {

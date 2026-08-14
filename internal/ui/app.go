@@ -132,9 +132,15 @@ func (a *App) populateLeftList() {
 		} else {
 			mark = "[gray]ok[-]"
 		}
-		label := fmt.Sprintf("%s %s", mark, it.GRFID)
+		kindTag := ""
+		if it.Kind == KindObjectGRF {
+			kindTag = "[OBJ] "
+		}
+		label := fmt.Sprintf("%s %s%s", mark, kindTag, it.GRFID)
 		sec := ""
-		if it.Broken {
+		if it.Kind == KindObjectGRF {
+			sec = fmt.Sprintf("%d object type(s), %d instance(s)", len(it.ObjectSlots), len(it.ObjectInstances))
+		} else if it.Broken {
 			sec = fmt.Sprintf("%d slot(s), %d vehicle(s)", len(it.Slots), len(it.Vehicles))
 		} else if it.Loaded != nil {
 			sec = shorten(it.Loaded.Filename, 40)
@@ -162,7 +168,17 @@ func (a *App) renderGRFDetail() {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "[yellow]GRFID:[-] %s\n", it.GRFID)
-	if it.Broken {
+	if it.Kind == KindObjectGRF {
+		fmt.Fprintf(&b, "[red]Status: BROKEN (object/scenery GRF)[-] -- referenced by OBID but not loaded.\n")
+		fmt.Fprintf(&b, "Object type slots: %v\n", it.ObjectSlots)
+		fmt.Fprintf(&b, "Placed instances: %d\n", len(it.ObjectInstances))
+		if it.ObjectMatch != nil {
+			fmt.Fprintf(&b, "\n[green]Matched to:[-] grfid=%s entity_id=%d\n", it.ObjectMatch.TargetGRFID, it.ObjectMatch.TargetEntity)
+		} else {
+			fmt.Fprintf(&b, "\n[gray]Not matched yet.[-] Select a replacement on the right, then press 'm'.\n")
+			fmt.Fprintf(&b, "[gray]Object matching is best-effort: unresolved slots are left as-is rather than blocking the rest of the fix.[-]\n")
+		}
+	} else if it.Broken {
 		fmt.Fprintf(&b, "[red]Status: BROKEN[-] -- this GRF is referenced by the save but not loaded.\n")
 		fmt.Fprintf(&b, "Pool slots: %v\n", it.Slots)
 		fmt.Fprintf(&b, "Affected vehicles: %d\n", len(it.Vehicles))
@@ -188,7 +204,19 @@ func (a *App) populateVehicleList() {
 	a.vehicleList.Clear()
 	a.vehicleInfo.SetText("")
 	it := a.selectedItem
-	if it == nil || !it.Broken {
+	if it == nil {
+		return
+	}
+	if it.Kind == KindObjectGRF {
+		for _, o := range it.ObjectInstances {
+			a.vehicleList.AddItem(fmt.Sprintf("tile %d", o.Tile), "", 0, nil)
+		}
+		if len(it.ObjectInstances) > 0 {
+			a.showVehicleDetail(0)
+		}
+		return
+	}
+	if !it.Broken {
 		return
 	}
 	for _, v := range it.Vehicles {
@@ -206,7 +234,15 @@ func (a *App) populateVehicleList() {
 
 func (a *App) showVehicleDetail(i int) {
 	it := a.selectedItem
-	if it == nil || i < 0 || i >= len(it.Vehicles) {
+	if it == nil {
+		a.vehicleInfo.SetText("")
+		return
+	}
+	if it.Kind == KindObjectGRF {
+		a.showObjectInstanceDetail(i)
+		return
+	}
+	if i < 0 || i >= len(it.Vehicles) {
 		a.vehicleInfo.SetText("")
 		return
 	}
@@ -236,9 +272,30 @@ func (a *App) showVehicleDetail(i int) {
 	a.vehicleInfo.SetText(b.String())
 }
 
+// showObjectInstanceDetail renders one placed object instance (tile,
+// footprint, build date, town) in the same bottom-centre pane vehicle
+// detail uses. Object instances have no per-instance removal/replacement
+// state -- unlike vehicles, fixing a broken object GRF is a single
+// GRF-level OBID repoint (see ApplyObjectSwaps), not a per-instance choice.
+func (a *App) showObjectInstanceDetail(i int) {
+	it := a.selectedItem
+	if it == nil || i < 0 || i >= len(it.ObjectInstances) {
+		a.vehicleInfo.SetText("")
+		return
+	}
+	o := it.ObjectInstances[i]
+	var b strings.Builder
+	fmt.Fprintf(&b, "[yellow]Tile:[-] %d\n", o.Tile)
+	fmt.Fprintf(&b, "[yellow]Footprint:[-] %dx%d\n", o.Width, o.Height)
+	fmt.Fprintf(&b, "[yellow]Build date (day count):[-] %d\n", o.BuildDate)
+	fmt.Fprintf(&b, "[yellow]Colour:[-] %d   [yellow]View:[-] %d\n", o.Colour, o.View)
+	fmt.Fprintf(&b, "[yellow]Object type slot:[-] %d\n", o.ObjectType)
+	a.vehicleInfo.SetText(b.String())
+}
+
 func (a *App) toggleRemoveVehicle(i int) {
 	it := a.selectedItem
-	if it == nil || i < 0 || i >= len(it.Vehicles) {
+	if it == nil || it.Kind == KindObjectGRF || i < 0 || i >= len(it.Vehicles) {
 		return
 	}
 	id := it.Vehicles[i].VehicleID
@@ -421,11 +478,78 @@ func (a *App) matchSelectedTo(rightIdx int) {
 	if c == nil {
 		return
 	}
+	if it.Kind == KindObjectGRF {
+		parsed, ok := a.model.ParsedCandidates[c.GRFIDHex()]
+		if !ok || len(parsed.Objects) == 0 {
+			a.setStatus("[red]That GRF hasn't been downloaded/parsed yet, or has no object specs -- download it first (see 'd').[-]")
+			return
+		}
+		a.promptObjectPicker(c, parsed, it)
+		return
+	}
 	if parsed, ok := a.model.ParsedCandidates[c.GRFIDHex()]; ok && len(parsed.Engines) > 0 {
 		a.promptEnginePicker(c, parsed, it)
 		return
 	}
 	a.promptInternalID(c, it)
+}
+
+// promptObjectPicker is the object/scenery equivalent of
+// promptEnginePicker: shows the replacement GRF's actual, dynamically-
+// parsed object roster and lets the user pick one directly. Selecting an
+// object sets it.ObjectMatch, which applyAndSave turns into an
+// engine.ObjectAssignment repointing every one of this item's OBID slots
+// at the chosen (grfid, entity_id) -- see ApplyObjectSwaps.
+func (a *App) promptObjectPicker(c *bananas.ContentInfo, parsed *grf.ParsedGRF, it *Item) {
+	list := tview.NewList().ShowSecondaryText(true)
+	objects := append([]grf.ParsedObject(nil), parsed.Objects...)
+	sort.Slice(objects, func(i, j int) bool { return objects[i].LocalID < objects[j].LocalID })
+	for i := range objects {
+		o := &objects[i]
+		sec := fmt.Sprintf("id=%d", o.LocalID)
+		if o.HasIntroDate {
+			sec += fmt.Sprintf("  intro=%d", grf.DayCountToYear(o.IntroDate))
+			retireYear := 0
+			if o.HasEndOfLifeDate && o.EndOfLifeDate != 0 {
+				retireYear = grf.DayCountToYear(o.EndOfLifeDate)
+			}
+			for _, w := range engine.CheckEngineDateAvailability(a.model.Year, grf.DayCountToYear(o.IntroDate), retireYear) {
+				sec += "  [orange]! " + w.Message + "[-]"
+			}
+		}
+		name := o.Name
+		if name == "" {
+			name = fmt.Sprintf("object #%d", o.LocalID)
+		}
+		list.AddItem(name, sec, 0, nil)
+	}
+
+	pages := tview.NewPages()
+	list.SetSelectedFunc(func(i int, main, sec string, sc rune) {
+		o := objects[i]
+		entity := uint8(o.LocalID)
+		if o.LocalID > 0xFF {
+			// Only reachable for a GRF using the SLV_EXTEND_ENTITY_MAPPING
+			// wide-entity encoding this save predates -- not expected in
+			// practice for this tool's target saves, but fail loudly
+			// rather than silently truncate the ID.
+			a.setStatus(fmt.Sprintf("[red]Object local ID %d doesn't fit this save's 1-byte entity_id field -- can't match automatically.[-]", o.LocalID))
+			a.tapp.SetRoot(a.rootLayout(), true).SetFocus(a.leftList)
+			return
+		}
+		it.ObjectMatch = &engine.ObjectAssignment{Slots: it.ObjectSlots, TargetGRFID: c.GRFIDHex(), TargetEntity: entity}
+		a.renderGRFDetail()
+		a.refreshLeftLabel()
+		a.tapp.SetRoot(a.rootLayout(), true).SetFocus(a.leftList)
+	})
+	list.SetBorder(true).SetTitle(fmt.Sprintf(" Match %s -> pick object in %s (Esc to cancel) ", it.GRFID, c.Name))
+	list.SetDoneFunc(func() {
+		a.tapp.SetRoot(a.rootLayout(), true).SetFocus(a.rightList)
+	})
+	modal := center(list, 100, 24)
+	pages.AddPage("background", a.rootLayout(), true, true)
+	pages.AddPage("modal", modal, true, true)
+	a.tapp.SetRoot(pages, true).SetFocus(list)
 }
 
 // promptEnginePicker shows the replacement GRF's actual, dynamically-
@@ -628,20 +752,47 @@ func (a *App) applyAndSave() {
 			len(unmatchedBroken), strings.Join(unmatchedBroken, ", ")))
 		return
 	}
-	if len(plan.Assignments) == 0 {
+
+	// Object/scenery GRFs are fixed independently of the vehicle plan
+	// above (see ObjectAssignment's doc comment for why no shared slot
+	// allocation is needed). Best-effort by design: an item left
+	// unmatched just stays broken rather than blocking the whole apply --
+	// see the user-facing note in renderGRFDetail.
+	var objectAssignments []engine.ObjectAssignment
+	for _, it := range m.Items {
+		if it.Kind == KindObjectGRF && it.ObjectMatch != nil {
+			objectAssignments = append(objectAssignments, *it.ObjectMatch)
+		}
+	}
+
+	if len(plan.Assignments) == 0 && len(objectAssignments) == 0 {
 		a.setStatus("[yellow]Nothing to apply.[-]")
 		return
 	}
 
-	res, err := engine.Apply(m.Analysis, plan)
-	if err != nil {
-		a.setStatus(fmt.Sprintf("[red]Plan error: %v[-]", err))
-		return
+	var newPayload []byte
+	if len(plan.Assignments) > 0 {
+		res, err := engine.Apply(m.Analysis, plan)
+		if err != nil {
+			a.setStatus(fmt.Sprintf("[red]Plan error: %v[-]", err))
+			return
+		}
+		newPayload, err = engine.ApplyToPayload(m.Payload, m.EIDS, m.NGRF, m.Vehicles, res, m.PendingGRFs, nil)
+		if err != nil {
+			a.setStatus(fmt.Sprintf("[red]Apply failed: %v[-]", err))
+			return
+		}
+	} else {
+		newPayload = m.Payload
 	}
-	newPayload, err := engine.ApplyToPayload(m.Payload, m.EIDS, m.NGRF, m.Vehicles, res, m.PendingGRFs, nil)
-	if err != nil {
-		a.setStatus(fmt.Sprintf("[red]Apply failed: %v[-]", err))
-		return
+
+	if len(objectAssignments) > 0 {
+		var err error
+		newPayload, err = engine.ApplyObjectSwaps(newPayload, objectAssignments)
+		if err != nil {
+			a.setStatus(fmt.Sprintf("[red]Object swap failed: %v[-]", err))
+			return
+		}
 	}
 
 	outPath := outputPath(m.Path)

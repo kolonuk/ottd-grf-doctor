@@ -126,7 +126,7 @@ func TestXpressways2082FixMatchesKnownGood(t *testing.T) {
 		t.Fatalf("parsing VEHS: %v", err)
 	}
 
-	an := Analyze(eids, ngrf, vehicles)
+	an := Analyze(eids, ngrf, vehicles, nil, nil)
 
 	var slot328IDs, slot329FrontIDs, slot24IDs []int
 	rearByCargo := map[uint8][]int{}

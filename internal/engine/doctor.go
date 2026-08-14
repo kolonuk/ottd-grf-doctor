@@ -132,6 +132,68 @@ func ApplyToPayload(payload []byte, eids []EIDSEntry, ngrf []NGRFEntry, vehicles
 	return out, nil
 }
 
+// ObjectAssignment says: repoint this missing object GRF's ObjectType
+// slots to a specific replacement (grfid, entity_id) pair -- e.g. an
+// equivalent object spec from a newly-inserted or already-loaded GRF.
+//
+// Unlike vehicles, ObjectType pool slots are stable identifiers every
+// OBJS instance references directly by value, so fixing a broken object
+// GRF never needs to reallocate slots, move OBJS records, or do anything
+// like the multiheaded-pairing fixup vehicles need -- repointing the OBID
+// entry in place is the whole fix.
+type ObjectAssignment struct {
+	Slots        []int // OBID slots (ObjectType values), e.g. a MissingObjectGRF's Slots
+	TargetGRFID  string
+	TargetEntity uint8
+}
+
+// ApplyObjectSwaps patches the given OBID slots in place to point at each
+// assignment's replacement (grfid, entity_id), returning the new payload.
+// It never mutates the input. OBJS instances need no changes (see
+// ObjectAssignment's doc comment).
+//
+// substitute_id is always written as 0: real savegames observed during
+// this tool's development have substitute_id == 0 for every populated
+// OBID entry regardless of entity_id, unlike EIDS's substitute_id (which
+// mirrors internal_id) -- see EncodeEIDSEntry's doc comment for contrast.
+func ApplyObjectSwaps(payload []byte, assignments []ObjectAssignment) ([]byte, error) {
+	out := append([]byte(nil), payload...)
+
+	chunks, err := sav.WalkChunks(out)
+	if err != nil {
+		return nil, err
+	}
+	cm := sav.ChunkMapOf(chunks)
+	obidChunk, ok := cm["OBID"]
+	if !ok {
+		return nil, fmt.Errorf("OBID chunk not found")
+	}
+
+	for _, a := range assignments {
+		enc, err := EncodeOBIDEntry(a.TargetGRFID, a.TargetEntity, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, slot := range a.Slots {
+			if slot >= len(obidChunk.Records) {
+				return nil, fmt.Errorf("object slot %d out of range (OBID has %d records)", slot, len(obidChunk.Records))
+			}
+			rec := obidChunk.Records[slot]
+			copy(out[rec.Offset:rec.Offset+rec.Length], enc[:])
+		}
+	}
+
+	reparsed, err := ParseOBID(out, mustChunk(out, "OBID"))
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateUniqueObjectKeys(reparsed); err != nil {
+		return nil, fmt.Errorf("refusing to write save: %w", err)
+	}
+
+	return out, nil
+}
+
 func mustChunk(payload []byte, id string) *sav.Chunk {
 	chunks, err := sav.WalkChunks(payload)
 	if err != nil {
