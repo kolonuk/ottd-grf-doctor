@@ -1,10 +1,9 @@
 // Command grfdoctor is a console tool for diagnosing and fixing OpenTTD
 // savegames whose vehicles reference NewGRFs that are no longer loaded.
 //
-// This is the CLI entry point. The interactive TUI (analyze/browse/match
-// screens) lives alongside these subcommands and will become the default
-// invocation once it's wired up; until then, `grfdoctor <subcommand>`
-// covers the scriptable/CI-facing parts of the tool.
+// This is the CLI entry point. `grfdoctor fix <savegame.sav>` launches
+// the interactive TUI; `analyze` and `lint` cover the scriptable/CI-facing
+// parts of the tool.
 package main
 
 import (
@@ -16,6 +15,7 @@ import (
 	"github.com/kolonuk/ottd-grf-doctor/internal/engine"
 	"github.com/kolonuk/ottd-grf-doctor/internal/lint"
 	"github.com/kolonuk/ottd-grf-doctor/internal/sav"
+	"github.com/kolonuk/ottd-grf-doctor/internal/ui"
 )
 
 func main() {
@@ -29,6 +29,8 @@ func main() {
 		err = runAnalyze(os.Args[2:])
 	case "lint":
 		err = runLint(os.Args[2:])
+	case "fix":
+		err = runFix(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -56,9 +58,23 @@ Usage:
       uniqueness, VEHS engine references). With --openttd, also does a
       real headless load as a smoke test.
 
-The interactive TUI for browsing replacement GRFs and building a fix plan
-is not wired up yet -- see README.md for current status.
+  grfdoctor fix <savegame.sav>
+      Launch the interactive TUI: browse broken GRFs, search and download
+      replacements from the live BaNaNaS catalog, match broken vehicles to
+      new engines (with carriage removal and non-blocking date/railtype
+      warnings), then apply, lint, and save.
 `)
+}
+
+func runFix(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: grfdoctor fix <savegame.sav>")
+	}
+	m, err := ui.LoadModel(args[0])
+	if err != nil {
+		return err
+	}
+	return ui.NewApp(m).Run()
 }
 
 func runAnalyze(args []string) error {

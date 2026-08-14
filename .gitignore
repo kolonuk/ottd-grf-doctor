@@ -2,3 +2,4 @@
 *.tar.xz
 /openttd-bin/
 latest.yaml
+/grf-downloads/
