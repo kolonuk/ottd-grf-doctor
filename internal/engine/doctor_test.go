@@ -126,7 +126,7 @@ func TestXpressways2082FixMatchesKnownGood(t *testing.T) {
 		t.Fatalf("parsing VEHS: %v", err)
 	}
 
-	an := Analyze(eids, ngrf, vehicles, nil, nil)
+	an := Analyze(eids, ngrf, vehicles, nil, nil, nil)
 
 	var slot328IDs, slot329FrontIDs, slot24IDs []int
 	rearByCargo := map[uint8][]int{}
@@ -215,7 +215,7 @@ func TestXpressways2082FixMatchesKnownGood(t *testing.T) {
 	// list (nothing references them anymore once the fix is applied).
 	unusedGRFs := []string{"4B523033", "42531320"}
 
-	newPayload, err := ApplyToPayload(broken.Payload, eids, ngrf, vehicles, res, nil, unusedGRFs)
+	newPayload, err := ApplyToPayload(broken.Payload, eids, ngrf, vehicles, nil, res, nil, unusedGRFs)
 	if err != nil {
 		t.Fatalf("ApplyToPayload: %v", err)
 	}

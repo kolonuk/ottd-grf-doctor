@@ -14,15 +14,12 @@ import (
 )
 
 // ItemKind distinguishes what kind of content a left-list Item
-// represents. Only KindVehicleGRF is actually detectable/fixable today
-// (see internal/engine's train-only scope); KindObjectGRF exists so the
-// data model and UI don't need reshaping if/when object or station
-// support is added -- it is never populated by LoadModel yet.
+// represents.
 type ItemKind int
 
 const (
-	KindVehicleGRF ItemKind = iota
-	KindObjectGRF           // scenery/station-object support -- see ObjectSlots/ObjectInstances/ObjectMatch
+	KindVehicleGRF ItemKind = iota // a train, road vehicle, ship, or aircraft GRF -- see VehicleKind
+	KindObjectGRF                  // scenery/station-object support -- see ObjectSlots/ObjectInstances/ObjectMatch
 )
 
 // Item is one row in the left-hand list: either a missing GRF (broken,
@@ -32,9 +29,28 @@ type Item struct {
 	GRFID  string
 	Broken bool
 
-	// Populated for broken vehicle items from engine.Analyze.
+	// VehicleKind says which of the four vehicle types this item is,
+	// when Kind == KindVehicleGRF (VehTrain, VehRoad, VehShip, or
+	// VehAircraft). A single GRF only ever defines one category in
+	// practice, so exactly one of Vehicles/OtherVehicles below is
+	// populated to match.
+	VehicleKind engine.VehicleType
+
+	// Populated for broken train items from engine.Analyze. Train
+	// removal (deleting a wagon) and multiheaded-pairing fixup are
+	// train-specific OpenTTD mechanics with no equivalent for the other
+	// three vehicle types -- see RemovedVehIDs' doc comment.
 	Slots    []int
 	Vehicles []engine.TrainVehicle
+
+	// Populated for broken road vehicle/ship/aircraft items from
+	// engine.Analyze. These support matching (replacing the broken
+	// engine reference) but not removal -- unlike trains, there's no
+	// consist-relinking concern for a single road vehicle/ship/aircraft,
+	// and articulated-road-vehicle trailer removal isn't implemented
+	// (out of scope for now; see project notes).
+	OtherSlots    []int
+	OtherVehicles []engine.OtherVehicle
 
 	// Populated for broken object items from engine.Analyze. Object pool
 	// slots (ObjectType) are stable identifiers OBJS instances reference
@@ -50,12 +66,22 @@ type Item struct {
 
 	// Match state, set by the matching workflow.
 	Match         *engine.TargetEngine
-	RemovedVehIDs map[int]bool // VehicleIDs from this item explicitly marked for removal instead of Match
+	RemovedVehIDs map[int]bool // VehicleIDs from this item explicitly marked for removal instead of Match -- trains only, see Vehicles' doc comment
+}
+
+// VehicleCount is however many real vehicles/instances this item
+// affects, regardless of which of Vehicles/OtherVehicles/ObjectInstances
+// is the populated one.
+func (it *Item) VehicleCount() int {
+	return len(it.Vehicles) + len(it.OtherVehicles) + len(it.ObjectInstances)
 }
 
 func (it *Item) Matched() bool {
 	if it.Kind == KindObjectGRF {
 		return it.ObjectMatch != nil
+	}
+	if len(it.OtherVehicles) > 0 {
+		return it.Match != nil
 	}
 	return it.Match != nil || (it.Broken && len(it.RemovedVehIDs) == len(it.Vehicles) && len(it.Vehicles) > 0)
 }
@@ -68,12 +94,13 @@ type Model struct {
 	Save    *sav.Save
 	Payload []byte
 
-	EIDS     []engine.EIDSEntry
-	NGRF     []engine.NGRFEntry
-	Vehicles []engine.TrainVehicle
-	OBID     []engine.ObjectTypeEntry
-	Objects  []engine.ObjectInstance
-	Analysis *engine.Analysis
+	EIDS          []engine.EIDSEntry
+	NGRF          []engine.NGRFEntry
+	Vehicles      []engine.TrainVehicle
+	OtherVehicles []engine.OtherVehicle
+	OBID          []engine.ObjectTypeEntry
+	Objects       []engine.ObjectInstance
+	Analysis      *engine.Analysis
 
 	Year       int
 	RailLabels []string
@@ -120,6 +147,10 @@ func LoadModel(path string) (*Model, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing VEHS: %w", err)
 	}
+	otherVehicles, err := engine.ParseOtherVehicles(s.Payload, cm["VEHS"])
+	if err != nil {
+		return nil, fmt.Errorf("parsing VEHS (road/ship/aircraft): %w", err)
+	}
 	// OBID/OBJS (object/scenery GRF mapping) are optional -- older or
 	// unusual saves might lack them entirely; treat that as "no objects"
 	// rather than failing the whole load.
@@ -135,7 +166,7 @@ func LoadModel(path string) (*Model, error) {
 			return nil, fmt.Errorf("parsing OBJS: %w", err)
 		}
 	}
-	an := engine.Analyze(eids, ngrf, vehicles, obid, objs)
+	an := engine.Analyze(eids, ngrf, vehicles, otherVehicles, obid, objs)
 
 	year, err := engine.ParseInGameYear(s.Payload, cm["DATE"])
 	if err != nil {
@@ -152,16 +183,27 @@ func LoadModel(path string) (*Model, error) {
 
 	m := &Model{
 		Path: path, Save: s, Payload: s.Payload,
-		EIDS: eids, NGRF: ngrf, Vehicles: vehicles, OBID: obid, Objects: objs, Analysis: an,
+		EIDS: eids, NGRF: ngrf, Vehicles: vehicles, OtherVehicles: otherVehicles,
+		OBID: obid, Objects: objs, Analysis: an,
 		Year: year, RailLabels: railLabels, Tiles: tiles,
 		Bananas:          &bananas.Client{},
 		ParsedCandidates: map[string]*grf.ParsedGRF{},
 	}
 
 	for _, missing := range an.Missing {
+		if len(missing.OtherVehicles) > 0 {
+			m.Items = append(m.Items, &Item{
+				Kind: KindVehicleGRF, GRFID: missing.GRFID, Broken: true,
+				VehicleKind:   missing.OtherVehicles[0].Kind,
+				OtherSlots:    missing.Slots,
+				OtherVehicles: missing.OtherVehicles,
+			})
+			continue
+		}
 		m.Items = append(m.Items, &Item{
 			Kind: KindVehicleGRF, GRFID: missing.GRFID, Broken: true,
-			Slots: missing.Slots, Vehicles: missing.Vehicles,
+			VehicleKind: engine.VehTrain,
+			Slots:       missing.Slots, Vehicles: missing.Vehicles,
 			RemovedVehIDs: map[int]bool{},
 		})
 	}

@@ -1,15 +1,31 @@
 package grf
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 // TestParseRealGRF verifies the dynamic parser against a real,
-// currently-published NewGRF (JP+ Multiple Units) checked into
-// testdata/grf-fixtures -- not a synthetic/hand-built file. The
-// assertions cross-check against real-world, independently verifiable
-// facts (the KiHa 40 series DMU's well-documented 1977 introduction),
-// not just "did it not crash".
+// currently-published NewGRF (JP+ Multiple Units), not a synthetic/
+// hand-built file. The assertions cross-check against real-world,
+// independently verifiable facts (the KiHa 40 series DMU's well-
+// documented 1977 introduction), not just "did it not crash".
+//
+// The 18MB .grf itself is deliberately NOT committed to the repo (see
+// .gitignore) -- fetch it locally to re-run this test:
+//
+//	mkdir -p testdata/grf-fixtures
+//	# download "JP+ Multiple Units" from https://bananas.openttd.org
+//	# and place the extracted JPplus_v055.grf at the path below.
+//
+// Skips (not fails) when the fixture isn't present, so a fresh clone's
+// test suite stays green without it.
 func TestParseRealGRF(t *testing.T) {
-	parsed, err := ParseGRF("../../testdata/grf-fixtures/JPplus_v055.grf")
+	const fixture = "../../testdata/grf-fixtures/JPplus_v055.grf"
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("real GRF fixture not present (%v) -- see this test's doc comment to fetch it locally", err)
+	}
+	parsed, err := ParseGRF(fixture)
 	if err != nil {
 		t.Fatalf("ParseGRF: %v", err)
 	}

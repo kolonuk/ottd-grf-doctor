@@ -123,7 +123,7 @@ func TestAnalyzeObjectsRealSave(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	an := Analyze(eids, ngrf, vehicles, obid, objs)
+	an := Analyze(eids, ngrf, vehicles, nil, obid, objs)
 	if len(an.MissingObjects) != 0 {
 		t.Errorf("expected no missing object GRFs in this fixture, got %d: %+v", len(an.MissingObjects), an.MissingObjects)
 	}

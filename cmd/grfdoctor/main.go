@@ -103,6 +103,10 @@ func runAnalyze(args []string) error {
 	if err != nil {
 		return fmt.Errorf("parsing VEHS: %w", err)
 	}
+	otherVehicles, err := engine.ParseOtherVehicles(s.Payload, cm["VEHS"])
+	if err != nil {
+		return fmt.Errorf("parsing VEHS (road/ship/aircraft): %w", err)
+	}
 	obid, err := engine.ParseOBID(s.Payload, cm["OBID"])
 	if err != nil {
 		return fmt.Errorf("parsing OBID: %w", err)
@@ -112,7 +116,7 @@ func runAnalyze(args []string) error {
 		return fmt.Errorf("parsing OBJS: %w", err)
 	}
 
-	an := engine.Analyze(eids, ngrf, vehicles, obid, objs)
+	an := engine.Analyze(eids, ngrf, vehicles, otherVehicles, obid, objs)
 	if len(an.Missing) == 0 && len(an.MissingObjects) == 0 {
 		fmt.Println("No missing NewGRF references found -- every engine/object slot this save uses is either a default or a currently-loaded GRF.")
 		return nil
@@ -121,7 +125,7 @@ func runAnalyze(args []string) error {
 	if len(an.Missing) > 0 {
 		fmt.Printf("Found %d missing vehicle NewGRF(s):\n\n", len(an.Missing))
 		for _, m := range an.Missing {
-			fmt.Printf("GRFID %s: %d engine slot(s), %d affected vehicle(s)\n", m.GRFID, len(m.Slots), len(m.Vehicles))
+			fmt.Printf("GRFID %s: %d engine slot(s), %d train(s), %d other vehicle(s)\n", m.GRFID, len(m.Slots), len(m.Vehicles), len(m.OtherVehicles))
 			fmt.Printf("  slots: %v\n", m.Slots)
 		}
 	}

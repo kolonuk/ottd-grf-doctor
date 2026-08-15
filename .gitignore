@@ -4,3 +4,20 @@
 latest.yaml
 /grf-downloads/
 .git-commit-msg.txt
+
+# Real third-party .grf fixtures are useful for local testing (see
+# internal/grf/parse_test.go) but too large to keep in git history --
+# fetch them locally per that test's doc comment instead.
+testdata/grf-fixtures/*.grf
+
+# Savegames grfdoctor writes when run manually against a testdata fixture
+# (outputPath() always appends .fixed.sav) -- the deliberately-committed
+# known-good comparison fixtures are named exactly "fixed.sav", which
+# this pattern does not match.
+testdata/**/*.fixed.sav
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -22,10 +22,17 @@ type NewGRFToInsert struct {
 // a copy of the save's payload, plus any needed NGRF insertions and
 // removals, and returns the new payload. It never mutates the input.
 //
+// otherVehicles carries the road vehicle/ship/aircraft records a plan's
+// assignments might reference (see Item.OtherVehicles) -- pass nil if
+// the plan only ever touches trains. Removal and multiheaded-pairing
+// fixup are train-only mechanics with no equivalent for the other three
+// types (see Item.OtherVehicles' doc comment), so VehiclesRemoved only
+// ever contains train VehicleIDs.
+//
 // removeGRFIDs drops NGRF entries (e.g. a NewGRF that no vehicle
 // references anymore after this fix, such as one being swapped out) --
 // pass nil if there's nothing to remove.
-func ApplyToPayload(payload []byte, eids []EIDSEntry, ngrf []NGRFEntry, vehicles []TrainVehicle,
+func ApplyToPayload(payload []byte, eids []EIDSEntry, ngrf []NGRFEntry, vehicles []TrainVehicle, otherVehicles []OtherVehicle,
 	res *ApplyResult, newGRFs []NewGRFToInsert, removeGRFIDs []string) ([]byte, error) {
 
 	out := append([]byte(nil), payload...)
@@ -37,6 +44,19 @@ func ApplyToPayload(payload []byte, eids []EIDSEntry, ngrf []NGRFEntry, vehicles
 	cm := sav.ChunkMapOf(chunks)
 
 	// --- 1. Patch EIDS: repointed canonical slots + fillers ---
+	// A repointed slot is written with the VehicleType of whatever it's
+	// now hosting (res.SlotTypes -- see Apply's doc comment on why this
+	// can differ from the slot's previous occupant, e.g. a slot freed by
+	// a broken train GRF reused for a new aircraft engine). A filler
+	// slot keeps the ORIGINAL EIDS entry's type: it isn't being
+	// reassigned to host a different vehicle type, just marked unused.
+	// EIDS's uniqueness key is (grfid, internal_id, type), so getting
+	// either of these wrong risks exactly the kind of silent-collision-
+	// then-pool-hole bug ValidateUniqueKeys exists to catch.
+	origSlotType := make(map[int]VehicleType, len(eids))
+	for _, e := range eids {
+		origSlotType[e.EngineID] = e.Type
+	}
 	eidsChunk, ok := cm["EIDS"]
 	if !ok {
 		return nil, fmt.Errorf("EIDS chunk not found")
@@ -45,7 +65,7 @@ func ApplyToPayload(payload []byte, eids []EIDSEntry, ngrf []NGRFEntry, vehicles
 		if slot >= len(eidsChunk.Records) {
 			return nil, fmt.Errorf("target slot %d out of range (EIDS has %d records)", slot, len(eidsChunk.Records))
 		}
-		enc, err := EncodeEIDSEntry(target.GRFID, target.InternalID, VehTrain)
+		enc, err := EncodeEIDSEntry(target.GRFID, target.InternalID, res.SlotTypes[slot])
 		if err != nil {
 			return nil, err
 		}
@@ -56,7 +76,7 @@ func ApplyToPayload(payload []byte, eids []EIDSEntry, ngrf []NGRFEntry, vehicles
 		if slot >= len(eidsChunk.Records) {
 			return nil, fmt.Errorf("filler slot %d out of range", slot)
 		}
-		enc, err := EncodeEIDSEntry(InvalidGRFID, fillerID, VehTrain)
+		enc, err := EncodeEIDSEntry(InvalidGRFID, fillerID, origSlotType[slot])
 		if err != nil {
 			return nil, err
 		}
@@ -75,29 +95,36 @@ func ApplyToPayload(payload []byte, eids []EIDSEntry, ngrf []NGRFEntry, vehicles
 	}
 
 	// --- 3. Patch VEHS engine_type for every moved vehicle, fixing up
-	//        multiheaded pairing along the way. ---
-	vehsChunk := cm["VEHS"]
+	//        multiheaded pairing along the way (trains only). ---
 	byID := make(map[int]*TrainVehicle, len(vehicles))
 	vehiclesCopy := append([]TrainVehicle(nil), vehicles...)
 	for i := range vehiclesCopy {
 		byID[vehiclesCopy[i].VehicleID] = &vehiclesCopy[i]
 	}
+	otherByID := make(map[int]*OtherVehicle, len(otherVehicles))
+	otherVehiclesCopy := append([]OtherVehicle(nil), otherVehicles...)
+	for i := range otherVehiclesCopy {
+		otherByID[otherVehiclesCopy[i].VehicleID] = &otherVehiclesCopy[i]
+	}
 
 	for vid, newSlot := range res.VehiclesMoved {
-		tv, ok := byID[vid]
-		if !ok {
-			return nil, fmt.Errorf("moved vehicle %d not found in VEHS", vid)
+		if tv, ok := byID[vid]; ok {
+			SetEngineType(out, tv, uint16(newSlot))
+			continue
 		}
-		SetEngineType(out, tv, uint16(newSlot))
+		if ov, ok := otherByID[vid]; ok {
+			SetOtherEngineType(out, ov, uint16(newSlot))
+			continue
+		}
+		return nil, fmt.Errorf("moved vehicle %d not found in VEHS", vid)
 	}
 
 	for _, fix := range findBrokenMultiheadPairs(vehiclesCopy, res.VehiclesMoved) {
 		tv := byID[fix.VehicleID]
 		SetSubtype(out, tv, fix.NewSubtype)
 	}
-	_ = vehsChunk
 
-	// --- 4. Remove vehicles marked for deletion. ---
+	// --- 4. Remove vehicles marked for deletion (trains only). ---
 	if len(res.VehiclesRemoved) > 0 {
 		out, err = removeVehicles(out, byID, res.VehiclesRemoved)
 		if err != nil {

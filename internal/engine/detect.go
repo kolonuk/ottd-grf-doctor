@@ -4,11 +4,15 @@ import "sort"
 
 // MissingGRF groups together the EIDS pool slots and affected vehicles for
 // one NewGRF that used to be loaded but no longer is (its grfid appears in
-// EIDS but not in the current NGRF list).
+// EIDS but not in the current NGRF list). A single GRF only ever defines
+// one vehicle category in practice, so exactly one of Vehicles/
+// OtherVehicles is populated for a given MissingGRF -- both fields exist
+// so callers don't need to know which in advance.
 type MissingGRF struct {
-	GRFID    string
-	Slots    []int // EngineID pool slots (indices into EIDS) sourced from this grfid
-	Vehicles []TrainVehicle
+	GRFID         string
+	Slots         []int          // EngineID pool slots (indices into EIDS) sourced from this grfid
+	Vehicles      []TrainVehicle // populated when this GRF's slots are trains
+	OtherVehicles []OtherVehicle // populated when this GRF's slots are road vehicles, ships, or aircraft
 }
 
 // MissingObjectGRF is the object/scenery equivalent of MissingGRF: one
@@ -37,11 +41,17 @@ type Analysis struct {
 
 // Analyze cross-references the EIDS and OBID chunks' grfids against the
 // currently loaded NGRF list to find every GRF that's referenced but not
-// present, then attributes every train vehicle / object instance whose
-// slot lands on one of those grfids. obid/objs may be nil if the save
-// doesn't have those chunks (or the caller doesn't care about objects);
-// object detection is simply skipped in that case.
-func Analyze(eids []EIDSEntry, ngrf []NGRFEntry, vehicles []TrainVehicle, obid []ObjectTypeEntry, objs []ObjectInstance) *Analysis {
+// present, then attributes every vehicle / object instance whose slot
+// lands on one of those grfids. otherVehicles/obid/objs may be nil if
+// the caller doesn't have or doesn't care about that data (e.g. a
+// caller only interested in trains); that category of detection is
+// simply skipped in that case. EngineID (EIDS's index / every vehicle's
+// engine_type) is a single pool shared by all four vehicle types (see
+// src/engine.h -- one global EnginePool, not per-type), so a slot found
+// here can safely be cross-referenced against both TrainVehicle and
+// OtherVehicle records without risk of collision between e.g. a train's
+// engine #5 and a road vehicle's engine #5.
+func Analyze(eids []EIDSEntry, ngrf []NGRFEntry, vehicles []TrainVehicle, otherVehicles []OtherVehicle, obid []ObjectTypeEntry, objs []ObjectInstance) *Analysis {
 	loaded := make(map[string]bool, len(ngrf))
 	for _, e := range ngrf {
 		loaded[e.GRFID] = true
@@ -66,14 +76,21 @@ func Analyze(eids []EIDSEntry, ngrf []NGRFEntry, vehicles []TrainVehicle, obid [
 			vehiclesByGRFID[grfid] = append(vehiclesByGRFID[grfid], v)
 		}
 	}
+	otherVehiclesByGRFID := make(map[string][]OtherVehicle)
+	for _, v := range otherVehicles {
+		if grfid, ok := slotGRFID[int(v.EngineType)]; ok {
+			otherVehiclesByGRFID[grfid] = append(otherVehiclesByGRFID[grfid], v)
+		}
+	}
 
 	a := &Analysis{LoadedGRFIDs: loaded}
 	for grfid, slots := range slotsByGRFID {
 		sort.Ints(slots)
 		a.Missing = append(a.Missing, MissingGRF{
-			GRFID:    grfid,
-			Slots:    slots,
-			Vehicles: vehiclesByGRFID[grfid],
+			GRFID:         grfid,
+			Slots:         slots,
+			Vehicles:      vehiclesByGRFID[grfid],
+			OtherVehicles: otherVehiclesByGRFID[grfid],
 		})
 	}
 	sort.Slice(a.Missing, func(i, j int) bool { return a.Missing[i].GRFID < a.Missing[j].GRFID })

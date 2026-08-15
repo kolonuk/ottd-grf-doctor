@@ -125,6 +125,7 @@ func (a *slotAllocator) fillerInternalID(usedByTargets map[uint16]bool) uint16 {
 // ApplyResult summarizes what Apply did, for display/logging.
 type ApplyResult struct {
 	SlotsRepointed  map[int]TargetEngine // EngineID -> new target
+	SlotTypes       map[int]VehicleType  // EngineID -> the VehicleType of the vehicles now assigned to it (SlotsRepointed keys only -- see doc comment on why this can't just be read back from the original EIDS entry)
 	FillerSlots     map[int]uint16       // EngineID -> filler internal_id assigned
 	VehiclesMoved   map[int]int          // VehicleID -> new EngineID slot
 	VehiclesRemoved []int                // VehicleID values deleted
@@ -135,6 +136,22 @@ type ApplyResult struct {
 // VEHS/removal helpers in doctor.go consume this result to actually edit
 // the payload. Keeping this pure makes it easy to preview a plan in the
 // TUI before committing it.
+//
+// A slot freed up by one broken GRF can end up hosting a replacement
+// engine for a *different* vehicle type than whatever used to occupy it
+// (e.g. a slot freed by a broken train GRF reused for a new aircraft
+// engine) -- this is not a bug to avoid, it's how OpenTTD's own engine
+// pool actually works: SetupEngines() (src/engine.cpp) constructs each
+// pool slot's Engine object using whichever VehicleType bucket its EIDS
+// entry belongs to at load time, not anything fixed to the slot number
+// itself (verified directly against that function during this tool's
+// development). SlotTypes on the result therefore records each
+// repointed slot's *new* type (the type of the vehicles actually being
+// reassigned to it) rather than the type of whatever it used to be --
+// getting this backwards was a real bug caught by this package's own
+// tests, since writing the *old* type into EIDS for a slot now hosting a
+// different vehicle type would misclassify it exactly the way
+// ValidateUniqueKeys' doc comment warns about.
 func Apply(an *Analysis, plan *Plan) (*ApplyResult, error) {
 	var allBroken []int
 	for _, m := range an.Missing {
@@ -144,14 +161,18 @@ func Apply(an *Analysis, plan *Plan) (*ApplyResult, error) {
 
 	res := &ApplyResult{
 		SlotsRepointed: make(map[int]TargetEngine),
+		SlotTypes:      make(map[int]VehicleType),
 		FillerSlots:    make(map[int]uint16),
 		VehiclesMoved:  make(map[int]int),
 	}
 
-	vehicleByID := make(map[int]TrainVehicle)
+	vehicleType := make(map[int]VehicleType)
 	for _, m := range an.Missing {
 		for _, v := range m.Vehicles {
-			vehicleByID[v.VehicleID] = v
+			vehicleType[v.VehicleID] = VehTrain
+		}
+		for _, v := range m.OtherVehicles {
+			vehicleType[v.VehicleID] = v.Kind
 		}
 	}
 
@@ -167,15 +188,23 @@ func Apply(an *Analysis, plan *Plan) (*ApplyResult, error) {
 			res.VehiclesRemoved = append(res.VehiclesRemoved, a.VehicleIDs...)
 			continue
 		}
+		if len(a.VehicleIDs) == 0 {
+			return nil, fmt.Errorf("assignment for target %+v has no vehicles", a.Target)
+		}
 		slot, err := alloc.slotFor(a.Target, a.PreferredSlot)
 		if err != nil {
 			return nil, err
 		}
 		res.SlotsRepointed[slot] = a.Target
 		for _, vid := range a.VehicleIDs {
-			if _, ok := vehicleByID[vid]; !ok {
+			vt, ok := vehicleType[vid]
+			if !ok {
 				return nil, fmt.Errorf("assignment references unknown vehicle id %d", vid)
 			}
+			if existing, set := res.SlotTypes[slot]; set && existing != vt {
+				return nil, fmt.Errorf("target %+v is claimed by vehicles of two different types (%d and %d) -- a single target engine can't serve both", a.Target, existing, vt)
+			}
+			res.SlotTypes[slot] = vt
 			res.VehiclesMoved[vid] = slot
 		}
 	}

@@ -25,11 +25,16 @@ func (e unknownPropertyError) Error() string {
 func errUnknownProperty(prop uint8) error { return unknownPropertyError{prop: prop} }
 
 // ParseGRF reads a container-format-2 .grf file (see container.go's doc
-// comment for what that means and its limits) and extracts every train
-// engine and object it defines, with whatever properties this package
-// knows how to read (see action0_trains.go / action0_objects.go for
-// exactly which -- verified directly against OpenTTD's own property
-// handlers, not guessed).
+// comment for what that means and its limits) and extracts every
+// vehicle (train, road vehicle, ship, aircraft) and object it defines,
+// with whatever properties this package knows how to read (see
+// action0_trains.go / action0_road.go / action0_ships.go /
+// action0_aircraft.go / action0_objects.go for exactly which --
+// verified directly against OpenTTD's own property handlers, not
+// guessed). ParsedEngine.Feature distinguishes which of the four
+// vehicle types each entry describes; local IDs are only unique within
+// one feature (a road vehicle #5 and a ship #5 are unrelated engines),
+// so this keeps a separate map per feature while parsing.
 func ParseGRF(path string) (*ParsedGRF, error) {
 	data, err := loadFile(path)
 	if err != nil {
@@ -40,7 +45,10 @@ func ParseGRF(path string) (*ParsedGRF, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 
-	engines := map[uint16]*ParsedEngine{}
+	trainEngines := map[uint16]*ParsedEngine{}
+	roadEngines := map[uint16]*ParsedEngine{}
+	shipEngines := map[uint16]*ParsedEngine{}
+	aircraftEngines := map[uint16]*ParsedEngine{}
 	objects := map[uint16]*ParsedObject{}
 	names := newNameTable()
 	result := &ParsedGRF{}
@@ -53,7 +61,7 @@ func ParseGRF(path string) (*ParsedGRF, error) {
 		body := ps.Data[1:]
 		switch action {
 		case 0x00:
-			if err := parseAction0(body, engines, objects); err != nil {
+			if err := parseAction0(body, trainEngines, roadEngines, shipEngines, aircraftEngines, objects); err != nil {
 				result.Warnings = append(result.Warnings, err.Error())
 			}
 		case 0x04:
@@ -68,14 +76,11 @@ func ParseGRF(path string) (*ParsedGRF, error) {
 		}
 	}
 
-	for id, e := range engines {
-		if name, ok := names.trainNames[id]; ok {
-			e.Name = name
-		} else {
-			e.Name = fmt.Sprintf("Engine #%d", id)
-		}
-		result.Engines = append(result.Engines, *e)
-	}
+	resolveEngineNames(trainEngines, names.trainNames, result)
+	resolveEngineNames(roadEngines, names.roadNames, result)
+	resolveEngineNames(shipEngines, names.shipNames, result)
+	resolveEngineNames(aircraftEngines, names.aircraftNames, result)
+
 	for id, o := range objects {
 		if name, ok := names.genericStrings[o.NameStringID]; ok {
 			o.Name = name
@@ -88,11 +93,22 @@ func ParseGRF(path string) (*ParsedGRF, error) {
 	return result, nil
 }
 
+func resolveEngineNames(engines map[uint16]*ParsedEngine, byID map[uint16]string, result *ParsedGRF) {
+	for id, e := range engines {
+		if name, ok := byID[id]; ok {
+			e.Name = name
+		} else {
+			e.Name = fmt.Sprintf("Engine #%d", id)
+		}
+		result.Engines = append(result.Engines, *e)
+	}
+}
+
 // parseAction0 decodes one Action0 pseudo-sprite (already past the
 // leading 0x00 action byte) per FeatureChangeInfo's documented format:
 //
 //	<00> <feature> <num-props> <num-info> <id> (<property> <new-info>)...
-func parseAction0(body []byte, engines map[uint16]*ParsedEngine, objects map[uint16]*ParsedObject) error {
+func parseAction0(body []byte, trainEngines, roadEngines, shipEngines, aircraftEngines map[uint16]*ParsedEngine, objects map[uint16]*ParsedObject) error {
 	r := newByteReader(body)
 	feature, err := r.ReadByte()
 	if err != nil {
@@ -121,8 +137,20 @@ func parseAction0(body []byte, engines map[uint16]*ParsedEngine, objects map[uin
 		}
 		switch feature {
 		case gsfTrains:
-			if err := parseTrainAction0(r, first, uint32(numinfo), prop, engines); err != nil {
+			if err := parseTrainAction0(r, first, uint32(numinfo), prop, trainEngines); err != nil {
 				return fmt.Errorf("Action0 trains, property 0x%02X: %w", prop, err)
+			}
+		case gsfRoadVehicles:
+			if err := parseRoadAction0(r, first, uint32(numinfo), prop, roadEngines); err != nil {
+				return fmt.Errorf("Action0 road vehicles, property 0x%02X: %w", prop, err)
+			}
+		case gsfShips:
+			if err := parseShipAction0(r, first, uint32(numinfo), prop, shipEngines); err != nil {
+				return fmt.Errorf("Action0 ships, property 0x%02X: %w", prop, err)
+			}
+		case gsfAircraft:
+			if err := parseAircraftAction0(r, first, uint32(numinfo), prop, aircraftEngines); err != nil {
+				return fmt.Errorf("Action0 aircraft, property 0x%02X: %w", prop, err)
 			}
 		case gsfObjects:
 			if err := parseObjectAction0(r, first, uint32(numinfo), prop, objects); err != nil {

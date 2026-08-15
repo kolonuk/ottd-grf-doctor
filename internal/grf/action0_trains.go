@@ -9,8 +9,16 @@ package grf
 // value is NOT the same as "verified absent"; see the Has* flags.
 type ParsedEngine struct {
 	LocalID uint16
+	Feature uint8  // gsfTrains, gsfRoadVehicles, gsfShips, or gsfAircraft -- which vehicle type this entry describes
 	Name    string // best-effort, see resolveNames; falls back to "Engine #<id>" if unresolved
 
+	// HasTrackType/TrackType apply to trains (railtype, prop 0x05) and
+	// road vehicles (road/tram type, prop 0x05 -- same property number,
+	// different meaning) alike; ships and aircraft have no equivalent
+	// (no track/infrastructure type restricts where they can go) and
+	// leave this false. As with trains, a GRF's own translation table
+	// (Action0 GSF_RAILTYPES/GSF_ROADTYPES) is not resolved -- see
+	// TrackTypeIsTranslated.
 	HasTrackType          bool
 	TrackType             uint8 // raw property value: 0=rail/electric(engclass-dependent), 1=mono, 2=maglev, or an index into this GRF's own railtype translation table (see TrackTypeIsTranslated)
 	TrackTypeIsTranslated bool
@@ -28,7 +36,7 @@ type ParsedEngine struct {
 	HasWeight    bool
 	Weight       uint16 // low+high byte combined
 	HasCapacity  bool
-	Capacity     uint8
+	Capacity     uint16 // trains/road vehicles set this from a 1-byte property (max 255); ships/aircraft can use a wider one -- widened here so all four features share one field
 	HasCargoType bool
 	CargoType    uint8 // raw translated-table index; see README.md for the caveat on interpreting this without the GRF's cargo translation table
 
@@ -69,7 +77,7 @@ func parseTrainAction0(r *byteReader, first, numinfo uint32, prop uint8, engines
 		id := uint16(first + i)
 		e, ok := engines[id]
 		if !ok {
-			e = &ParsedEngine{LocalID: id}
+			e = &ParsedEngine{LocalID: id, Feature: gsfTrains}
 			engines[id] = e
 		}
 		if err := applyTrainProperty(r, prop, e); err != nil {
@@ -132,7 +140,7 @@ func applyTrainProperty(r *byteReader, prop uint8, e *ParsedEngine) error {
 			return err
 		}
 		e.HasCapacity = true
-		e.Capacity = b
+		e.Capacity = uint16(b)
 	case 0x15: // cargo type
 		b, err := r.ReadByte()
 		if err != nil {

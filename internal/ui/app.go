@@ -255,18 +255,28 @@ func (a *App) renderGRFDetail() {
 		}
 	} else if it.Broken {
 		fmt.Fprintf(&b, "[red]Status: BROKEN[-] -- this GRF is referenced by the save but not loaded.\n")
-		fmt.Fprintf(&b, "Pool slots: %v\n", it.Slots)
-		fmt.Fprintf(&b, "Affected vehicles: %d\n", len(it.Vehicles))
+		fmt.Fprintf(&b, "Vehicle kind: %s\n", vehicleKindLabel(it.VehicleKind))
+		if len(it.OtherVehicles) > 0 {
+			fmt.Fprintf(&b, "Pool slots: %v\n", it.OtherSlots)
+			fmt.Fprintf(&b, "Affected %s: %d\n", strings.ToLower(vehicleKindLabel(it.VehicleKind)), len(it.OtherVehicles))
+		} else {
+			fmt.Fprintf(&b, "Pool slots: %v\n", it.Slots)
+			fmt.Fprintf(&b, "Affected vehicles: %d\n", len(it.Vehicles))
+		}
 		if it.Match != nil {
 			fmt.Fprintf(&b, "\n[green]Matched to:[-] %s (grfid=%s internal_id=%d)\n", it.Match.Name, it.Match.GRFID, it.Match.InternalID)
 		} else {
+			compareLine := "[gray] 3.[-] Press [yellow]Enter[-] on it to open the engine picker\n"
+			if it.VehicleKind == engine.VehTrain {
+				compareLine = "[gray] 3.[-] Press [yellow]Enter[-] on it to open the engine picker, compared\n" +
+					"    side-by-side against what this vehicle currently looks like\n"
+			}
 			fmt.Fprint(&b, "\n[gray]Not matched yet.[-] To fix:\n"+
 				"[gray] 1.[-] Tab to [yellow]Replacement candidates[-] (right) and search/browse --\n"+
-				"    only GRFs tagged \"train\" are shown\n"+
+				"    only GRFs tagged \""+vehicleKindTag(it.VehicleKind)+"\" are shown\n"+
 				"[gray] 2.[-] Press [yellow]d[-] to download and parse it (or skip this and\n"+
 				"    press Enter directly if you already know the internal ID)\n"+
-				"[gray] 3.[-] Press [yellow]Enter[-] on it to open the engine picker, compared\n"+
-				"    side-by-side against what this vehicle currently looks like\n")
+				compareLine)
 		}
 		if n := len(it.RemovedVehIDs); n > 0 {
 			fmt.Fprintf(&b, "%d vehicle(s) marked for removal instead of replacement.\n", n)
@@ -299,8 +309,17 @@ func (a *App) populateVehicleList() {
 		}
 		return
 	}
-	a.vehicleList.SetTitle(" Affected Vehicles ")
+	a.vehicleList.SetTitle(" Affected " + vehicleKindLabel(it.VehicleKind) + " ")
 	if !it.Broken {
+		return
+	}
+	if len(it.OtherVehicles) > 0 {
+		// Road vehicles/ships/aircraft support matching but not removal
+		// (see Item.OtherVehicles' doc comment), so no per-row mark here.
+		for _, v := range it.OtherVehicles {
+			a.vehicleList.AddItem(fmt.Sprintf("  #%d", v.UnitNumber), "", 0, nil)
+		}
+		a.showVehicleDetail(0)
 		return
 	}
 	for _, v := range it.Vehicles {
@@ -316,6 +335,23 @@ func (a *App) populateVehicleList() {
 	}
 }
 
+// vehicleKindLabel is the display name for a VehicleKind, used in panel
+// titles ("Affected Trains", "Affected Aircraft", ...).
+func vehicleKindLabel(k engine.VehicleType) string {
+	switch k {
+	case engine.VehTrain:
+		return "Trains"
+	case engine.VehRoad:
+		return "Road Vehicles"
+	case engine.VehShip:
+		return "Ships"
+	case engine.VehAircraft:
+		return "Aircraft"
+	default:
+		return "Vehicles"
+	}
+}
+
 func (a *App) showVehicleDetail(i int) {
 	it := a.selectedItem
 	if it == nil {
@@ -324,6 +360,10 @@ func (a *App) showVehicleDetail(i int) {
 	}
 	if it.Kind == KindObjectGRF {
 		a.showObjectInstanceDetail(i)
+		return
+	}
+	if len(it.OtherVehicles) > 0 {
+		a.showOtherVehicleDetail(i)
 		return
 	}
 	if i < 0 || i >= len(it.Vehicles) {
@@ -357,10 +397,42 @@ func (a *App) showVehicleDetail(i int) {
 		fmt.Fprint(&b, "\n(Enter to mark this vehicle for removal instead of replacement)\n")
 	}
 	if it.Match != nil {
-		candidateRT, hasDate, introYear, retireYear := a.replacementInfo(it.Match)
+		candidateRT, hasDate, introYear, retireYear := a.replacementInfo(it.Match, it.VehicleKind)
 		for _, w := range engine.CheckRailtypeCompatibility(rt, candidateRT) {
 			fmt.Fprintf(&b, "\n[orange]Warning:[-] %s\n", w.Message)
 		}
+		if hasDate {
+			for _, w := range engine.CheckEngineDateAvailability(a.model.Year, introYear, retireYear) {
+				fmt.Fprintf(&b, "\n[orange]Warning:[-] %s\n", w.Message)
+			}
+		}
+	}
+	a.vehicleInfo.SetText(b.String())
+}
+
+// showOtherVehicleDetail is showVehicleDetail's equivalent for road
+// vehicles/ships/aircraft (see Item.OtherVehicles' doc comment for why
+// they don't share TrainVehicle's removal/multiheaded-pairing/railtype-
+// at-tile concerns): unit, cargo, and -- if a match has been made --
+// date-availability warnings against it. No track/infrastructure
+// compatibility check is done here (this tool doesn't parse road/
+// waterway/airport tile data the way it does rail).
+func (a *App) showOtherVehicleDetail(i int) {
+	it := a.selectedItem
+	if it == nil || i < 0 || i >= len(it.OtherVehicles) {
+		a.vehicleInfo.SetText("")
+		return
+	}
+	v := it.OtherVehicles[i]
+	var b strings.Builder
+	fmt.Fprintf(&b, "[yellow]Unit #:[-] %d\n", v.UnitNumber)
+	fmt.Fprintf(&b, "[yellow]Cargo type:[-] %d   [yellow]Capacity:[-] %d\n", v.CargoType, v.CargoCap)
+	fmt.Fprintf(&b, "[yellow]Tile:[-] %d\n", v.Tile)
+	// No "currently displayed as" comparison here: engine.SubstituteEngineFor
+	// only has default-engine data for trains (see internal/engine/defaults.go's
+	// scope), so it can't be shown accurately for road vehicles/ships/aircraft.
+	if it.Match != nil {
+		_, hasDate, introYear, retireYear := a.replacementInfo(it.Match, it.VehicleKind)
 		if hasDate {
 			for _, w := range engine.CheckEngineDateAvailability(a.model.Year, introYear, retireYear) {
 				fmt.Fprintf(&b, "\n[orange]Warning:[-] %s\n", w.Message)
@@ -410,20 +482,28 @@ func (a *App) toggleRemoveVehicle(i int) {
 }
 
 // replacementInfo looks up everything known about a chosen target
-// engine: the default-engine table if it's a base-game engine, the
-// dynamically-parsed candidate roster if it's a downloaded third-party
-// GRF this session has parsed (see internal/grf), or nothing if neither
-// -- e.g. an internal ID typed in manually without downloading first.
-func (a *App) replacementInfo(t *engine.TargetEngine) (railtype engine.Railtype, hasDate bool, introYear, retireYear int) {
+// engine: the default-engine table if it's a base-game engine (trains
+// only -- this tool's default-engine data was only ever mined for
+// trains, see internal/engine/defaults.go), the dynamically-parsed
+// candidate roster if it's a downloaded third-party GRF this session has
+// parsed (see internal/grf), or nothing if neither -- e.g. an internal
+// ID typed in manually without downloading first. vehicleKind narrows
+// the parsed-candidate lookup to the right feature, since local IDs are
+// only unique within one vehicle type (grf.ParsedEngine.Feature uses the
+// same 0..3 encoding as engine.VehicleType, verified against both
+// packages' source).
+func (a *App) replacementInfo(t *engine.TargetEngine, vehicleKind engine.VehicleType) (railtype engine.Railtype, hasDate bool, introYear, retireYear int) {
 	if t.GRFID == engine.InvalidGRFID {
-		if d, ok := engine.DefaultTrainEngines[t.InternalID]; ok {
-			return d.Railtype, true, d.IntroYear, d.RetireYear
+		if vehicleKind == engine.VehTrain {
+			if d, ok := engine.DefaultTrainEngines[t.InternalID]; ok {
+				return d.Railtype, true, d.IntroYear, d.RetireYear
+			}
 		}
 		return engine.RailtypeUnknown, false, 0, 0
 	}
 	if parsed, ok := a.model.ParsedCandidates[t.GRFID]; ok {
 		for _, e := range parsed.Engines {
-			if e.LocalID != t.InternalID {
+			if e.LocalID != t.InternalID || e.Feature != uint8(vehicleKind) {
 				continue
 			}
 			rt := RailtypeOfParsedEngine(&e)
@@ -463,17 +543,44 @@ func (a *App) loadCatalog() {
 	})
 }
 
+// countEnginesOfKind counts a parsed GRF's engines matching the given
+// vehicle kind (grf.ParsedEngine.Feature uses the same 0..3 encoding as
+// engine.VehicleType) -- used to decide whether the real engine-picker
+// UI has anything to show for this item's specific vehicle type, versus
+// falling back to promptInternalID.
+func countEnginesOfKind(parsed *grf.ParsedGRF, kind engine.VehicleType) int {
+	n := 0
+	for _, e := range parsed.Engines {
+		if e.Feature == uint8(kind) {
+			n++
+		}
+	}
+	return n
+}
+
+// vehicleKindTag maps a VehicleType to the BaNaNaS catalog tag that
+// identifies GRFs defining that kind of vehicle (verified against the
+// live catalog: see project history).
+func vehicleKindTag(k engine.VehicleType) string {
+	switch k {
+	case engine.VehRoad:
+		return "road-vehicle"
+	case engine.VehShip:
+		return "ship"
+	case engine.VehAircraft:
+		return "aircraft"
+	default:
+		return "train"
+	}
+}
+
 // candidateMatches decides whether one catalog entry is worth offering as
 // a replacement for the currently-selected broken item, and whether it
 // matches the search box's text. Without the tag check, every one of the
 // ~1200 catalog NewGRFs was offered as a candidate for every broken item
 // -- signal sets, town name generators, ships as a train replacement --
 // which is the "appear to be ALL grfs, even ones not suitable" complaint
-// this fixes. The tag vocabulary (verified against the live catalog: see
-// project history) includes "train"/"road-vehicle"/"ship"/"aircraft" for
-// vehicles and "object" for scenery -- this tool only detects/fixes
-// broken train and object GRFs (see internal/engine's scope), so those
-// are the only two categories ever requested here.
+// this fixes.
 //
 // This deliberately does NOT hide candidates based on track compatibility
 // (an earlier version of this filter did, and it had a bad interaction:
@@ -484,8 +591,12 @@ func (a *App) loadCatalog() {
 // filterCatalog -- once the candidate is actually known (parsed).
 func (a *App) candidateMatches(c *bananas.ContentInfo, query string) bool {
 	wantTag := "train"
-	if a.selectedItem != nil && a.selectedItem.Kind == KindObjectGRF {
-		wantTag = "object"
+	if a.selectedItem != nil {
+		if a.selectedItem.Kind == KindObjectGRF {
+			wantTag = "object"
+		} else {
+			wantTag = vehicleKindTag(a.selectedItem.VehicleKind)
+		}
 	}
 	tagged := false
 	for _, t := range c.Tags {
@@ -683,7 +794,7 @@ func (a *App) matchSelectedTo(rightIdx int) {
 		a.promptObjectPicker(c, parsed, it)
 		return
 	}
-	if parsed, ok := a.model.ParsedCandidates[c.GRFIDHex()]; ok && len(parsed.Engines) > 0 {
+	if parsed, ok := a.model.ParsedCandidates[c.GRFIDHex()]; ok && countEnginesOfKind(parsed, it.VehicleKind) > 0 {
 		a.promptEnginePicker(c, parsed, it)
 		return
 	}
@@ -790,32 +901,38 @@ func engineTrackCompatible(actual, candidate engine.Railtype) bool {
 }
 
 // promptEnginePicker shows the replacement GRF's actual, dynamically-
-// parsed engine roster (name, track type, dates, speed/power) and lets
-// the user pick one directly -- no blind internal-ID entry, no
-// hardcoded per-GRF table (see internal/grf). A header above the list
-// shows what the broken vehicle currently displays as (its EIDS
-// substitute default engine, see engine.SubstituteEngineFor) for a
-// side-by-side comparison against each candidate row's own speed/power/
-// dates. By default only engines whose track type matches the broken
-// vehicle's actual track are listed (or every engine, if either side's
-// track type isn't known) -- 't' toggles showing the full roster,
-// including confirmed mismatches, with the same inline warning tags
-// promptEnginePicker has always shown for those.
+// parsed engine roster (name, track type, dates, speed/power) for the
+// item's specific vehicle kind (grf.ParsedEngine.Feature) and lets the
+// user pick one directly -- no blind internal-ID entry, no hardcoded
+// per-GRF table (see internal/grf). A header above the list shows what
+// the broken vehicle currently displays as for trains (its EIDS
+// substitute default engine, see engine.SubstituteEngineFor -- this
+// tool only has default-engine data for trains, so road vehicles/ships/
+// aircraft skip that line) for a side-by-side comparison against each
+// candidate row's own speed/power/dates. For trains, only engines whose
+// track type matches the broken vehicle's actual track are listed by
+// default (or every engine, if either side's track type isn't known);
+// road vehicles/ships/aircraft always show every engine (this tool has
+// no tile-level road/waterway/airport data to compare against) -- 't'
+// toggles showing the full roster for trains too, including confirmed
+// mismatches, with the same inline warning tags shown for those.
 func (a *App) promptEnginePicker(c *bananas.ContentInfo, parsed *grf.ParsedGRF, it *Item) {
 	var trackAt engine.Railtype
-	var repVehicle *engine.TrainVehicle
-	if len(it.Vehicles) > 0 {
-		repVehicle = &it.Vehicles[0]
-		trackAt = a.model.RailtypeAtTile(repVehicle.Tile)
-	}
+	var affectedCount int
+	var repCargoType uint8
+	var repCargoCap uint16
 
 	header := tview.NewTextView().SetDynamicColors(true).SetWrap(true)
 	header.SetBorder(true).SetTitle(" Comparison ")
-	if repVehicle != nil {
-		var h strings.Builder
+	var h strings.Builder
+	switch {
+	case len(it.Vehicles) > 0:
+		rep := &it.Vehicles[0]
+		trackAt = a.model.RailtypeAtTile(rep.Tile)
+		affectedCount, repCargoType, repCargoCap = len(it.Vehicles), rep.CargoType, rep.CargoCap
 		fmt.Fprintf(&h, "[yellow]This save's track here:[-] %s   [yellow]Cargo:[-] type %d, capacity %d   [yellow]Affected vehicles:[-] %d\n",
-			trackAt, repVehicle.CargoType, repVehicle.CargoCap, len(it.Vehicles))
-		if sub, ok := engine.SubstituteEngineFor(a.model.EIDS, repVehicle.EngineType); ok {
+			trackAt, repCargoType, repCargoCap, affectedCount)
+		if sub, ok := engine.SubstituteEngineFor(a.model.EIDS, rep.EngineType); ok {
 			retire := fmt.Sprintf("retire=%d", sub.RetireYear)
 			if sub.RetireYear == 0 {
 				retire = "never retires"
@@ -825,10 +942,21 @@ func (a *App) promptEnginePicker(c *bananas.ContentInfo, parsed *grf.ParsedGRF, 
 		} else {
 			fmt.Fprint(&h, "[gray]No current-engine data available for comparison.[-]")
 		}
-		header.SetText(h.String())
+	case len(it.OtherVehicles) > 0:
+		rep := &it.OtherVehicles[0]
+		affectedCount, repCargoType, repCargoCap = len(it.OtherVehicles), rep.CargoType, rep.CargoCap
+		fmt.Fprintf(&h, "[yellow]Cargo:[-] type %d, capacity %d   [yellow]Affected %s:[-] %d\n",
+			repCargoType, repCargoCap, strings.ToLower(vehicleKindLabel(it.VehicleKind)), affectedCount)
+		fmt.Fprint(&h, "[gray]No current-engine data available for comparison (default-engine data is only mined for trains).[-]")
 	}
+	header.SetText(h.String())
 
-	engines := append([]grf.ParsedEngine(nil), parsed.Engines...)
+	var engines []grf.ParsedEngine
+	for _, e := range parsed.Engines {
+		if e.Feature == uint8(it.VehicleKind) {
+			engines = append(engines, e)
+		}
+	}
 	sort.Slice(engines, func(i, j int) bool { return engines[i].LocalID < engines[j].LocalID })
 
 	list := tview.NewList().ShowSecondaryText(true)
@@ -840,18 +968,24 @@ func (a *App) promptEnginePicker(c *bananas.ContentInfo, parsed *grf.ParsedGRF, 
 		list.Clear()
 		shown = shown[:0]
 		hidden := 0
+		isTrain := it.VehicleKind == engine.VehTrain
 		for i := range engines {
 			e := &engines[i]
-			candidateRT := RailtypeOfParsedEngine(e)
-			if !showAll && !engineTrackCompatible(trackAt, candidateRT) {
-				hidden++
-				continue
+			var candidateRT engine.Railtype
+			if isTrain {
+				candidateRT = RailtypeOfParsedEngine(e)
+				if !showAll && !engineTrackCompatible(trackAt, candidateRT) {
+					hidden++
+					continue
+				}
 			}
 			shown = append(shown, *e)
 
 			var warn []string
-			for _, w := range engine.CheckRailtypeCompatibility(trackAt, candidateRT) {
-				warn = append(warn, w.Message)
+			if isTrain {
+				for _, w := range engine.CheckRailtypeCompatibility(trackAt, candidateRT) {
+					warn = append(warn, w.Message)
+				}
 			}
 			if e.HasIntroDate {
 				introYear := grf.DayCountToYear(e.IntroDate)
@@ -864,7 +998,7 @@ func (a *App) promptEnginePicker(c *bananas.ContentInfo, parsed *grf.ParsedGRF, 
 				}
 			}
 			sec := fmt.Sprintf("id=%d", e.LocalID)
-			if e.HasTrackType {
+			if isTrain && e.HasTrackType {
 				sec += "  track=" + candidateRT.String()
 			}
 			if e.HasIntroDate {
@@ -1120,17 +1254,20 @@ const helpText = `[yellow::b]grfdoctor -- keybindings[-::-]
 [yellow]Ctrl-X[-], [yellow]q[-]        Quit (asks first if you have unapplied matches/removals)
 Mouse               Click to select/focus; scroll to move within a list
 
-[yellow::b]Fixing a broken train GRF, step by step[-::-]
+[yellow::b]Fixing a broken GRF, step by step[-::-]
 
- 1. Select the broken GRF on the left (red "!") -- its affected vehicles and pool slots
-    show in the centre and bottom-centre panes.
- 2. Tab to Replacement candidates (right) and search/browse for a suitable train set --
-    only GRFs tagged "train" are ever shown.
- 3. Press [yellow]d[-] to download and parse the candidate -- this reads its real engine list
-    (names, track type, dates, speed, power) straight from the .grf file.
- 4. Press [yellow]Enter[-] on it: the engine picker opens with a comparison header showing what
-    the broken vehicle currently displays as (its substitute default engine's stats),
-    so you can pick a real like-for-like replacement instead of guessing.
+ 1. Select the broken GRF on the left (red "!") -- its affected vehicles/instances and pool
+    slots show in the centre and bottom-centre panes. The left list also says what kind it
+    is (train, road vehicle, ship, aircraft, or [OBJ] object/scenery).
+ 2. Tab to Replacement candidates (right) and search/browse for a suitable GRF -- only GRFs
+    tagged for that same kind are ever shown (a broken aircraft set won't offer trains).
+ 3. Press [yellow]d[-] to download and parse the candidate -- this reads its real engine/object list
+    (names, dates, speed, power, and for trains, track type) straight from the .grf file.
+ 4. Press [yellow]Enter[-] on it to open the picker and choose a specific replacement. For trains,
+    the picker also shows a comparison header (what the broken vehicle currently displays
+    as -- its substitute default engine's stats) to help pick a real like-for-like
+    replacement instead of guessing; this comparison isn't available for the other three
+    vehicle kinds (this tool's default-engine data is train-only).
  5. Repeat for every broken GRF, then press [yellow]A[-] to apply, lint, and write a new save file --
     your original is never modified.
 
@@ -1142,14 +1279,18 @@ Mouse               Click to select/focus; scroll to move within a list
 [yellow]GRF Detail[-] (top centre)    Detail of whichever GRF is currently relevant: the selected broken
                           item on the left, or the highlighted candidate on the right -- this pane
                           follows whichever list has focus.
-[yellow]Affected Vehicles[-]         Vehicles (or, for [OBJ] items, placed instances) that used the
-                          selected broken GRF.
+[yellow]Affected Trains/Road Vehicles/Ships/Aircraft/Objects[-]
+                          Vehicles (or, for [OBJ] items, placed instances) that used the
+                          selected broken GRF -- the title says which kind. Only trains
+                          support removing an individual vehicle instead of replacing it
+                          (road vehicles/ships/aircraft/objects only support matching).
 [yellow]Vehicle Detail[-]             Detail of the highlighted vehicle/instance -- including what it
-                          currently displays as (see step 4 above) -- plus any railtype or
-                          in-game-date compatibility warnings against the current match.
+                          currently displays as for trains (see step 4 above) -- plus any
+                          railtype or in-game-date compatibility warnings against the
+                          current match.
 [yellow]Replacement candidates[-]     The BaNaNaS catalog, filtered to GRFs tagged for the selected
-                          item's kind (trains for a vehicle GRF, objects for an object GRF) --
-                          so a broken train set won't offer ships or signal sets as replacements.
+                          item's exact kind -- so a broken train set won't offer ships,
+                          road vehicles, aircraft, or scenery as replacements.
 
 [yellow::b]Notes[-::-]
 
@@ -1203,7 +1344,21 @@ func (a *App) applyAndSave() {
 	plan := &engine.Plan{}
 	var unmatchedBroken []string
 	for _, it := range m.Items {
-		if !it.Broken {
+		if !it.Broken || it.Kind == KindObjectGRF {
+			continue
+		}
+		if len(it.OtherVehicles) > 0 {
+			// Road vehicles/ships/aircraft support matching but not
+			// removal -- see Item.OtherVehicles' doc comment.
+			if it.Match == nil {
+				unmatchedBroken = append(unmatchedBroken, it.GRFID)
+				continue
+			}
+			var vids []int
+			for _, v := range it.OtherVehicles {
+				vids = append(vids, v.VehicleID)
+			}
+			plan.Assignments = append(plan.Assignments, engine.NewAssignment(vids, *it.Match))
 			continue
 		}
 		var remainVehIDs []int
@@ -1256,7 +1411,7 @@ func (a *App) applyAndSave() {
 			a.setStatus(fmt.Sprintf("[red]Plan error: %v[-]", err))
 			return
 		}
-		newPayload, err = engine.ApplyToPayload(m.Payload, m.EIDS, m.NGRF, m.Vehicles, res, m.PendingGRFs, nil)
+		newPayload, err = engine.ApplyToPayload(m.Payload, m.EIDS, m.NGRF, m.Vehicles, m.OtherVehicles, res, m.PendingGRFs, nil)
 		if err != nil {
 			a.setStatus(fmt.Sprintf("[red]Apply failed: %v[-]", err))
 			return
