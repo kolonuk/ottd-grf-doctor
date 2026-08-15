@@ -47,12 +47,6 @@ type App struct {
 	modalDismissAnyKey bool
 	modalClose         func()
 
-	// showAllTracks, toggled by 't' while the right-hand list has focus,
-	// disables candidateMatches' track-compatibility filter (see its doc
-	// comment) so already-downloaded-and-parsed candidates with no
-	// track-matching engine show up again instead of being hidden.
-	showAllTracks bool
-
 	// dirty tracks whether there's matching/removal work that hasn't
 	// been applied+saved yet -- set whenever a match or removal is made,
 	// cleared on a successful applyAndSave. Standard "unsaved changes"
@@ -292,9 +286,11 @@ func (a *App) populateVehicleList() {
 	a.vehicleInfo.SetText("")
 	it := a.selectedItem
 	if it == nil {
+		a.vehicleList.SetTitle(" Affected Vehicles ")
 		return
 	}
 	if it.Kind == KindObjectGRF {
+		a.vehicleList.SetTitle(" Affected Objects ")
 		for _, o := range it.ObjectInstances {
 			a.vehicleList.AddItem(fmt.Sprintf("tile %d", o.Tile), "", 0, nil)
 		}
@@ -303,6 +299,7 @@ func (a *App) populateVehicleList() {
 		}
 		return
 	}
+	a.vehicleList.SetTitle(" Affected Vehicles ")
 	if !it.Broken {
 		return
 	}
@@ -478,15 +475,13 @@ func (a *App) loadCatalog() {
 // broken train and object GRFs (see internal/engine's scope), so those
 // are the only two categories ever requested here.
 //
-// A second, narrower filter applies on top of the tag check: if a
-// candidate has already been downloaded and parsed this session (see
-// downloadSelected), and NONE of its engines' track types match the
-// broken vehicle's actual current track, it's hidden too -- unless
-// showAllTracks is set ('t' while the right list has focus). This can
-// only apply to already-parsed candidates: the catalog itself carries no
-// per-engine track data, so an un-downloaded GRF's track compatibility
-// genuinely can't be known ahead of time and is never filtered on that
-// basis alone.
+// This deliberately does NOT hide candidates based on track compatibility
+// (an earlier version of this filter did, and it had a bad interaction:
+// pressing 'd' to download and check a candidate would make it vanish
+// from the list the instant it turned out incompatible, which is exactly
+// the wrong moment to lose it -- you just asked to look at it). Track
+// compatibility is surfaced instead, as a warning tag on the row -- see
+// filterCatalog -- once the candidate is actually known (parsed).
 func (a *App) candidateMatches(c *bananas.ContentInfo, query string) bool {
 	wantTag := "train"
 	if a.selectedItem != nil && a.selectedItem.Kind == KindObjectGRF {
@@ -506,49 +501,49 @@ func (a *App) candidateMatches(c *bananas.ContentInfo, query string) bool {
 	if q != "" && !strings.Contains(strings.ToLower(c.Name), q) && !strings.Contains(strings.ToLower(c.Desc), q) {
 		return false
 	}
-	if wantTag == "train" && !a.showAllTracks && a.selectedItem != nil && len(a.selectedItem.Vehicles) > 0 {
-		if parsed, ok := a.model.ParsedCandidates[c.GRFIDHex()]; ok {
-			trackAt := a.model.RailtypeAtTile(a.selectedItem.Vehicles[0].Tile)
-			anyCompatible := false
-			for i := range parsed.Engines {
-				if engineTrackCompatible(trackAt, RailtypeOfParsedEngine(&parsed.Engines[i])) {
-					anyCompatible = true
-					break
-				}
-			}
-			if !anyCompatible {
-				return false
-			}
+	return true
+}
+
+// candidateHasCompatibleTrack reports whether c is known (downloaded and
+// parsed this session) to have at least one engine whose track type
+// matches the broken vehicle's actual current track. The bool return
+// distinguishes "known incompatible" from "not parsed yet, can't tell" --
+// only the former should ever be flagged to the user.
+func (a *App) candidateHasCompatibleTrack(c *bananas.ContentInfo) (known, compatible bool) {
+	if a.selectedItem == nil || a.selectedItem.Kind != KindVehicleGRF || len(a.selectedItem.Vehicles) == 0 {
+		return false, false
+	}
+	parsed, ok := a.model.ParsedCandidates[c.GRFIDHex()]
+	if !ok {
+		return false, false
+	}
+	trackAt := a.model.RailtypeAtTile(a.selectedItem.Vehicles[0].Tile)
+	for i := range parsed.Engines {
+		if engineTrackCompatible(trackAt, RailtypeOfParsedEngine(&parsed.Engines[i])) {
+			return true, true
 		}
 	}
-	return true
+	return true, false
 }
 
 func (a *App) filterCatalog(query string) {
 	a.rightList.Clear()
-	shown, hiddenByTrack := 0, 0
+	shown := 0
 	for i := range a.catalog {
 		c := &a.catalog[i]
 		if !a.candidateMatches(c, query) {
-			if _, parsed := a.model.ParsedCandidates[c.GRFIDHex()]; parsed && !a.showAllTracks {
-				hiddenByTrack++
-			}
 			continue
 		}
 		sec := fmt.Sprintf("grfid=%s v%s", c.GRFIDHex(), c.Version)
+		if known, compatible := a.candidateHasCompatibleTrack(c); known && !compatible {
+			sec += "  [orange]! no engine matches this track[-]"
+		}
 		a.rightList.AddItem(c.Name, sec, 0, nil)
 		shown++
 		if shown >= 200 {
 			break // keep the list responsive; narrow the search for more
 		}
 	}
-	title := " Replacement candidates "
-	if a.showAllTracks {
-		title = " Replacement candidates [showing all tracks, 't' to filter] "
-	} else if hiddenByTrack > 0 {
-		title = fmt.Sprintf(" Replacement candidates [%d hidden by track mismatch, 't' to show] ", hiddenByTrack)
-	}
-	a.rightList.SetTitle(title)
 	if a.tapp.GetFocus() == a.rightList {
 		a.showCandidateDetail(a.rightList.GetCurrentItem())
 	}
@@ -655,7 +650,7 @@ func (a *App) downloadSelected() {
 			}
 			a.model.ParsedCandidates[c.GRFIDHex()] = parsed
 			a.setStatus(fmt.Sprintf("[green]Downloaded and parsed %s: %d engine(s) found[-] -- ready to match", c.Name, len(parsed.Engines)))
-			a.filterCatalog(a.searchInput.GetText()) // a newly-parsed candidate can now be track-filtered
+			a.filterCatalog(a.searchInput.GetText()) // a newly-parsed candidate can now show its track-compatibility warning
 		})
 	}()
 }
@@ -1020,12 +1015,6 @@ func (a *App) globalKeys(event *tcell.EventKey) *tcell.EventKey {
 			a.downloadSelected()
 			return nil
 		}
-	case 't':
-		if a.tapp.GetFocus() == a.rightList {
-			a.showAllTracks = !a.showAllTracks
-			a.filterCatalog(a.searchInput.GetText())
-			return nil
-		}
 	case 'A':
 		a.applyAndSave()
 		return nil
@@ -1102,7 +1091,7 @@ func (a *App) updateStatusHelp() {
 	case a.searchInput:
 		a.setStatus("[yellow]Tab[-] next panel  type to search candidates  [yellow]Esc/Ctrl-C[-] quit")
 	case a.rightList:
-		a.setStatus("[yellow]Tab[-] next panel  [yellow]↑↓[-] browse candidates  [yellow]Enter[-] match  [yellow]d[-] download  [yellow]t[-] toggle track filter" + common)
+		a.setStatus("[yellow]Tab[-] next panel  [yellow]↑↓[-] browse candidates  [yellow]Enter[-] match  [yellow]d[-] download" + common)
 	default:
 		a.setStatus("[yellow]?[-] help" + common)
 	}
@@ -1117,10 +1106,12 @@ const helpText = `[yellow::b]grfdoctor -- keybindings[-::-]
                     - on a Replacement candidate: open the engine/object picker to match it
                       to the selected broken GRF
                     - on an Affected Vehicle: toggle it for removal instead of replacement
-[yellow]d[-]                Download and parse the highlighted replacement candidate (right panel only)
-[yellow]t[-]                Toggle track-mismatch filtering (right panel, and inside the engine picker) --
-                    by default, candidates/engines with no engine matching this vehicle's
-                    actual track are hidden; 't' shows them anyway
+[yellow]d[-]                Download and parse the highlighted replacement candidate (right panel only) --
+                    once parsed, a candidate with no engine on this vehicle's actual track
+                    gets a "! no engine matches this track" tag (it stays in the list, just
+                    marked, so downloading something to check it never makes it vanish)
+[yellow]t[-]                Inside the engine picker only: toggle showing engines whose track doesn't
+                    match (hidden by default)
 [yellow]A[-]                Apply the current plan, lint the result, and write a new save file (never overwrites the original)
 [yellow]?[-] or [yellow]h[-]           Show this help screen
 [yellow]Esc[-]              Close a popup if one is open, otherwise quit (asks first if you have
@@ -1134,8 +1125,7 @@ Mouse               Click to select/focus; scroll to move within a list
  1. Select the broken GRF on the left (red "!") -- its affected vehicles and pool slots
     show in the centre and bottom-centre panes.
  2. Tab to Replacement candidates (right) and search/browse for a suitable train set --
-    only GRFs tagged "train" are ever shown, and once you've downloaded one, ones with
-    no track-compatible engine at all drop out too (see 't' above).
+    only GRFs tagged "train" are ever shown.
  3. Press [yellow]d[-] to download and parse the candidate -- this reads its real engine list
     (names, track type, dates, speed, power) straight from the .grf file.
  4. Press [yellow]Enter[-] on it: the engine picker opens with a comparison header showing what
